@@ -88,6 +88,8 @@ async def pipeline_status(
             "started_at": t.started_at.isoformat() if t.started_at else None,
             "completed_at": t.completed_at.isoformat() if t.completed_at else None,
             "error": t.error_message,
+            "current_message": t.current_message,
+            "result_metadata": t.result_metadata,
         }
         for t in agent_tasks
     ]

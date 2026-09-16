@@ -118,6 +118,7 @@ class Project(TimestampMixin, Base):
     story_timelines: Mapped[List["StoryTimeline"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     outputs: Mapped[List["Output"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     agent_tasks: Mapped[List["AgentTask"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    chat_messages: Mapped[List["ChatMessage"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class Clip(TimestampMixin, Base):
@@ -256,5 +257,27 @@ class AgentTask(TimestampMixin, Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     result_metadata: Mapped[Optional[Dict]] = mapped_column(JSON)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    current_message: Mapped[Optional[str]] = mapped_column(Text)  # last intra-stage progress message
 
     project: Mapped["Project"] = relationship(back_populates="agent_tasks")
+
+
+class ChatRole(str, enum.Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+class ChatMessage(Base):
+    """A message in a project's AI prompt/chat box (see backend/ai/interpreter.py)."""
+    __tablename__ = "chat_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    role: Mapped[ChatRole] = mapped_column(Enum(ChatRole), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    action_json: Mapped[Optional[Dict]] = mapped_column(JSON)  # what the interpreter did, if anything
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    project: Mapped["Project"] = relationship(back_populates="chat_messages")

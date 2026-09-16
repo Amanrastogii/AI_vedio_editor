@@ -29,7 +29,7 @@ export default function BackendStatus() {
 
   return (
     <div className="flex items-center gap-3">
-      <div className="flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1.5 text-xs">
+      <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs backdrop-blur">
         <span
           className={`h-2 w-2 rounded-full ${
             loading
@@ -43,7 +43,7 @@ export default function BackendStatus() {
           API {loading ? "checking…" : online ? `online · v${health?.version}` : "offline"}
         </span>
       </div>
-      <div className="flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1.5 text-xs">
+      <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs backdrop-blur">
         <span className={`h-2 w-2 rounded-full ${dbReady ? "bg-emerald-400" : "bg-orange-400"}`} />
         <span className="text-slate-300">DB {dbReady ? "ready" : "waiting"}</span>
       </div>

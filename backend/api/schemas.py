@@ -119,6 +119,7 @@ class OutputResponse(BaseModel):
     file_size_bytes: Optional[int]
     quality_score: Optional[float]
     download_url: Optional[str] = None
+    render_metadata: Optional[Dict[str, Any]] = None
 
     model_config = {"from_attributes": True}
 
@@ -126,12 +127,76 @@ class OutputResponse(BaseModel):
 # ── Story / EDL ───────────────────────────────────────────────────────────────
 
 class StoryEntryResponse(BaseModel):
+    id: uuid.UUID
     position: int
     narrative_role: str
     segment_id: Optional[uuid.UUID]
+    clip_id: Optional[uuid.UUID] = None
+    thumbnail_url: Optional[str] = None
+    start_ms: Optional[int] = None
+    end_ms: Optional[int] = None
     trim_start_ms: Optional[int]
     trim_end_ms: Optional[int]
     transition_in: str
     edit_reasoning: Optional[str]
+
+    model_config = {"from_attributes": True}
+
+
+class StoryEntryUpdate(BaseModel):
+    trim_start_ms: Optional[int] = None
+    trim_end_ms: Optional[int] = None
+    transition_in: Optional[str] = None
+    zoom_params: Optional[Dict[str, Any]] = None
+    reframe_params: Optional[Dict[str, Any]] = None
+
+
+class StoryEntryCreate(BaseModel):
+    segment_id: uuid.UUID
+    narrative_role: Optional[str] = None
+    transition_in: Optional[str] = "cut"
+
+
+class StoryReorderRequest(BaseModel):
+    entry_ids: List[uuid.UUID] = Field(min_length=1)
+
+
+class SegmentResponse(BaseModel):
+    id: uuid.UUID
+    clip_id: uuid.UUID
+    start_ms: int
+    end_ms: int
+    segment_type: str
+    quality_score: Optional[float]
+    engagement_score: Optional[float]
+    has_face: bool
+    keyframe_url: Optional[str] = None
+    on_timeline: bool = False
+
+    model_config = {"from_attributes": True}
+
+
+class RenderRequest(BaseModel):
+    output_formats: Optional[List[str]] = None
+
+
+class RenderResponse(BaseModel):
+    total_duration_ms: int
+    any_failed: bool
+    qa_passed: bool
+
+
+# ── Chat ──────────────────────────────────────────────────────────────────────
+
+class ChatMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class ChatMessageResponse(BaseModel):
+    id: uuid.UUID
+    role: str
+    content: str
+    action_json: Optional[Dict[str, Any]] = None
+    created_at: datetime
 
     model_config = {"from_attributes": True}

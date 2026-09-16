@@ -2,8 +2,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter, useParams } from "next/navigation";
-import Link from "next/link";
 import PipelineView from "@/components/PipelineView";
+import Editor from "@/components/editor/Editor";
+import AnimatedBackground from "@/components/ui/AnimatedBackground";
+import AppHeader from "@/components/ui/AppHeader";
+import SpinningDisc from "@/components/ui/SpinningDisc";
 import { FORMAT_META } from "@/lib/agents";
 import {
   Clip,
@@ -17,7 +20,13 @@ import {
   uploadClip,
 } from "@/lib/api";
 
-type Tab = "upload" | "pipeline" | "outputs";
+type Tab = "upload" | "dashboard" | "edit" | "outputs";
+const TABS: { key: Tab; label: string; icon: string }[] = [
+  { key: "upload", label: "Upload", icon: "⬆️" },
+  { key: "dashboard", label: "Dashboard", icon: "📊" },
+  { key: "edit", label: "Edit", icon: "🎛" },
+  { key: "outputs", label: "Outputs", icon: "🎬" },
+];
 
 export default function ProjectPage() {
   const router = useRouter();
@@ -29,6 +38,7 @@ export default function ProjectPage() {
   const [outputs, setOutputs] = useState<Output[]>([]);
   const [tab, setTab] = useState<Tab>("upload");
   const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [error, setError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
@@ -38,13 +48,11 @@ export default function ProjectPage() {
       const [p, c] = await Promise.all([getProject(id), listClips(id)]);
       setProject(p);
       setClips(c);
-      if (p.status === "processing") setTab("pipeline");
-      else if (p.status === "completed") {
-        setTab("outputs");
-        setOutputs(await listOutputs(id));
-      }
+      listOutputs(id).then(setOutputs).catch(() => {});
+      if (p.status === "processing") setTab("dashboard");
+      else if (p.status === "completed") setTab("outputs");
     } catch (e: any) {
-      if (String(e.message).includes("401")) router.push("/login");
+      if (/401|token/i.test(String(e.message))) router.push("/login");
       else setError(e.message);
     }
   }
@@ -81,7 +89,7 @@ export default function ProjectPage() {
       await startProcessing(id);
       const p = await getProject(id);
       setProject(p);
-      setTab("pipeline");
+      setTab("dashboard");
     } catch (e: any) {
       setError(e.message || "Failed to start processing");
     } finally {
@@ -97,64 +105,80 @@ export default function ProjectPage() {
 
   if (!project) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-bg text-slate-500">
-        {error ? <span className="text-red-400">{error}</span> : "Loading…"}
+      <main className="relative flex min-h-screen flex-col items-center justify-center gap-6 text-slate-400">
+        <AnimatedBackground />
+        {error ? (
+          <span className="text-red-400">{error}</span>
+        ) : (
+          <>
+            <SpinningDisc size={96} fast />
+            <span className="animate-pulse text-sm">Loading project…</span>
+          </>
+        )}
       </main>
     );
   }
 
-  return (
-    <main className="min-h-screen bg-bg">
-      <header className="sticky top-0 z-10 border-b border-border bg-bg/80 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
-          <div className="flex items-center gap-3">
-            <Link href="/" className="text-slate-400 transition hover:text-white">
-              ←
-            </Link>
-            <div>
-              <h1 className="text-base font-bold leading-tight">{project.title}</h1>
-              <p className="text-xs capitalize text-slate-400">{project.status}</p>
-            </div>
-          </div>
-        </div>
-      </header>
+  const canUpload = ["created", "uploading"].includes(project.status);
 
-      <div className="mx-auto max-w-5xl px-6 py-8">
+  return (
+    <main className="relative min-h-screen">
+      <AnimatedBackground />
+      <AppHeader title={project.title} subtitle={project.status} backHref="/" />
+
+      <div className="mx-auto max-w-6xl px-6 py-8">
         {/* Tabs */}
-        <div className="mb-6 flex gap-1 rounded-lg border border-border bg-surface p-1">
-          {(["upload", "pipeline", "outputs"] as Tab[]).map((t) => (
-            <button
-              key={t}
-              onClick={() => {
-                setTab(t);
-                if (t === "outputs") listOutputs(id).then(setOutputs);
-              }}
-              className={`flex-1 rounded-md px-4 py-2 text-sm font-medium capitalize transition ${
-                tab === t ? "bg-accent text-white" : "text-slate-400 hover:text-white"
-              }`}
-            >
-              {t === "upload" ? `Upload (${clips.length})` : t}
-            </button>
-          ))}
+        <div className="glass sticky top-[68px] z-10 mb-6 grid animate-fade-up grid-cols-4 gap-1 rounded-2xl p-1.5">
+          {TABS.map((t) => {
+            const active = tab === t.key;
+            return (
+              <button
+                key={t.key}
+                onClick={() => {
+                  setTab(t.key);
+                  if (t.key === "outputs") listOutputs(id).then(setOutputs);
+                }}
+                className={`relative flex items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium transition-all duration-300 ${
+                  active
+                    ? "bg-gradient-to-r from-accent to-accent4 text-white shadow-[0_8px_24px_-8px_rgba(124,131,245,0.7)]"
+                    : "text-slate-400 hover:bg-white/5 hover:text-white"
+                }`}
+              >
+                <span className={`transition-transform duration-300 ${active ? "scale-110" : ""}`}>{t.icon}</span>
+                <span className="hidden sm:inline">{t.label}</span>
+                {t.key === "upload" && clips.length > 0 && (
+                  <span className="rounded-full bg-black/30 px-1.5 text-[10px]">{clips.length}</span>
+                )}
+              </button>
+            );
+          })}
         </div>
 
         {error && (
-          <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+          <div className="mb-4 animate-fade-in rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
             {error}
           </div>
         )}
 
+        <div key={tab} className="animate-fade-up">
         {/* Upload tab */}
         {tab === "upload" && (
           <div>
             <div
-              onClick={() => fileRef.current?.click()}
-              onDragOver={(e) => e.preventDefault()}
+              onClick={() => canUpload && fileRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
               onDrop={(e) => {
                 e.preventDefault();
-                handleFiles(e.dataTransfer.files);
+                setDragOver(false);
+                if (canUpload) handleFiles(e.dataTransfer.files);
               }}
-              className="flex min-h-[160px] cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-border bg-surface/50 p-8 text-center transition hover:border-accent"
+              className={`glass group relative flex min-h-[240px] flex-col items-center justify-center overflow-hidden rounded-3xl border-2 border-dashed p-10 text-center transition-all duration-300 ${
+                canUpload ? "cursor-pointer" : "cursor-not-allowed opacity-70"
+              } ${dragOver ? "scale-[1.01] border-accent bg-accent/10" : "border-white/10 hover:border-accent/60"}`}
             >
               <input
                 ref={fileRef}
@@ -164,59 +188,96 @@ export default function ProjectPage() {
                 hidden
                 onChange={(e) => handleFiles(e.target.files)}
               />
-              <div className="mb-2 text-3xl">⬆️</div>
-              <p className="font-semibold">{uploading ? "Uploading…" : "Drop video clips or click to browse"}</p>
-              <p className="mt-1 text-xs text-slate-400">MP4, MOV, WebM · multiple files supported</p>
+              <div className="absolute inset-0 bg-gradient-to-br from-accent/5 via-transparent to-accent4/5 opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
+              <div className="relative mb-4">
+                {uploading ? (
+                  <SpinningDisc size={72} fast glow={false} />
+                ) : (
+                  <div className="flex h-16 w-16 animate-float items-center justify-center rounded-2xl bg-gradient-to-br from-accent to-accent4 text-3xl shadow-[0_12px_32px_-8px_rgba(124,131,245,0.7)]">
+                    ⬆️
+                  </div>
+                )}
+              </div>
+              <p className="relative text-lg font-bold">
+                {uploading
+                  ? "Uploading your clips…"
+                  : !canUpload
+                  ? "Uploads are closed for this project"
+                  : dragOver
+                  ? "Drop to upload"
+                  : "Drag & drop your video clips"}
+              </p>
+              <p className="relative mt-1 text-sm text-slate-400">
+                {canUpload ? "or click to browse · MP4, MOV, WebM · multiple files" : `Project is ${project.status}.`}
+              </p>
             </div>
 
             {clips.length > 0 && (
-              <div className="mt-6">
+              <div className="mt-8">
                 <h3 className="mb-3 text-sm font-bold uppercase tracking-wider text-slate-300">
-                  Uploaded clips
+                  Uploaded clips <span className="text-slate-500">· {clips.length}</span>
                 </h3>
-                <div className="space-y-2">
-                  {clips.map((c) => (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {clips.map((c, i) => (
                     <div
                       key={c.id}
-                      className="flex items-center justify-between rounded-lg border border-border bg-surface px-4 py-3"
+                      className="glass card-hover animate-fade-up overflow-hidden rounded-2xl"
+                      style={{ animationDelay: `${i * 60}ms` }}
                     >
-                      <div className="flex items-center gap-3">
-                        <span className="flex h-8 w-8 items-center justify-center rounded bg-surface2 text-xs">
-                          🎬
+                      <div className="relative aspect-video bg-gradient-to-br from-accent/30 to-accent4/20">
+                        {c.thumbnail_url ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={c.thumbnail_url} alt="" className="h-full w-full object-cover" />
+                        ) : (
+                          <div className="flex h-full items-center justify-center text-3xl opacity-60">🎬</div>
+                        )}
+                        <span className="absolute left-2 top-2 rounded-full bg-black/50 px-2 py-0.5 text-[10px] backdrop-blur">
+                          #{c.upload_order}
                         </span>
-                        <div>
-                          <p className="text-sm font-medium">{c.original_filename}</p>
-                          <p className="text-xs text-slate-500">
-                            {c.file_size_bytes
-                              ? `${(c.file_size_bytes / 1e6).toFixed(1)} MB`
-                              : "—"}{" "}
-                            · order #{c.upload_order}
+                        {c.duration_ms && (
+                          <span className="absolute bottom-2 right-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] backdrop-blur">
+                            {Math.round(c.duration_ms / 1000)}s
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between px-3 py-2.5">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{c.original_filename}</p>
+                          <p className="text-[11px] text-slate-500">
+                            {c.file_size_bytes ? `${(c.file_size_bytes / 1e6).toFixed(1)} MB` : "—"}
                           </p>
                         </div>
+                        <span className="flex items-center gap-1 text-[11px] text-emerald-400">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> ready
+                        </span>
                       </div>
-                      <span className="text-xs text-emerald-400">ready</span>
                     </div>
                   ))}
                 </div>
 
-                <button
-                  onClick={handleProcess}
-                  disabled={processing || project.status === "processing"}
-                  className="mt-6 w-full rounded-lg bg-gradient-to-r from-accent to-accent4 py-3 text-sm font-semibold text-white transition hover:opacity-90 disabled:opacity-50"
-                >
-                  {processing
-                    ? "Starting…"
-                    : project.status === "processing"
-                    ? "Processing…"
-                    : "🚀 Start AI Editing — Run 11-Agent Pipeline"}
-                </button>
+                {canUpload && (
+                  <button
+                    onClick={handleProcess}
+                    disabled={processing}
+                    className="btn-primary mt-8 w-full py-4 text-base"
+                  >
+                    {processing ? (
+                      <>
+                        <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                        Starting the pipeline…
+                      </>
+                    ) : (
+                      "🚀 Start AI editing — run the 11-agent pipeline"
+                    )}
+                  </button>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* Pipeline tab */}
-        {tab === "pipeline" && (
+        {/* Dashboard tab */}
+        {tab === "dashboard" && (
           <PipelineView
             projectId={id}
             initialStatus={project.status}
@@ -224,60 +285,108 @@ export default function ProjectPage() {
           />
         )}
 
+        {/* Edit tab — manual video editor: player, timeline, AI chat */}
+        {tab === "edit" && (
+          <Editor
+            projectId={id}
+            outputs={outputs}
+            onRendered={() => listOutputs(id).then(setOutputs)}
+          />
+        )}
+
         {/* Outputs tab */}
         {tab === "outputs" && (
           <div>
             {outputs.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-border bg-surface/50 py-16 text-center text-slate-400">
-                No outputs yet — run the pipeline first.
+              <div className="glass flex flex-col items-center rounded-3xl py-16 text-center">
+                <div className="animate-float">
+                  <SpinningDisc size={100} />
+                </div>
+                <p className="mt-8 font-bold">No videos yet</p>
+                <p className="mt-1 text-sm text-slate-400">Upload clips and run the pipeline to get your first cut.</p>
               </div>
             ) : (
-              <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
-                {outputs.map((o) => (
-                  <div key={o.id} className="rounded-xl border border-border bg-surface p-4">
-                    <div className="mb-3 flex items-center justify-between">
-                      <div>
-                        <h3 className="font-semibold">{FORMAT_META[o.format]?.label || o.format}</h3>
-                        <p className="text-xs text-slate-400">
-                          {o.aspect_ratio} · {o.width}×{o.height}
-                          {o.duration_ms ? ` · ${(o.duration_ms / 1000).toFixed(0)}s` : ""}
-                        </p>
+              <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+                {outputs.map((o, i) => {
+                  const vertical = (o.height ?? 0) > (o.width ?? 0);
+                  return (
+                    <div
+                      key={o.id}
+                      className="glass card-hover animate-fade-up overflow-hidden rounded-3xl"
+                      style={{ animationDelay: `${i * 80}ms` }}
+                    >
+                      <div className="flex items-center justify-between px-5 pt-4">
+                        <div>
+                          <h3 className="text-lg font-bold">{FORMAT_META[o.format]?.label || o.format}</h3>
+                          <p className="text-xs text-slate-400">
+                            {o.aspect_ratio} · {o.width}×{o.height}
+                            {o.duration_ms ? ` · ${(o.duration_ms / 1000).toFixed(0)}s` : ""}
+                            {o.file_size_bytes ? ` · ${(o.file_size_bytes / 1e6).toFixed(1)} MB` : ""}
+                          </p>
+                        </div>
+                        {o.quality_score != null && <QualityRing score={o.quality_score} />}
                       </div>
-                      {o.quality_score != null && (
-                        <span className="rounded-full bg-emerald-500/20 px-2.5 py-1 text-xs font-medium text-emerald-300">
-                          VMAF {o.quality_score}
-                        </span>
-                      )}
-                    </div>
-                    {o.download_url ? (
-                      <video
-                        src={o.download_url}
-                        controls
-                        className="aspect-video w-full rounded-lg bg-black"
-                      />
-                    ) : (
-                      <div className="flex aspect-video w-full items-center justify-center rounded-lg bg-black/50 text-xs text-slate-500">
-                        rendering…
+                      <div className="p-5">
+                        <div className={`mx-auto overflow-hidden rounded-2xl bg-black ${vertical ? "max-w-[240px]" : ""}`}>
+                          {o.download_url ? (
+                            <video
+                              src={o.download_url}
+                              controls
+                              className={`w-full bg-black ${vertical ? "aspect-[9/16]" : "aspect-video"}`}
+                            />
+                          ) : o.render_metadata?.error ? (
+                            <div className="flex aspect-video w-full flex-col items-center justify-center gap-1 bg-red-500/10 text-center text-xs text-red-300">
+                              <span>⚠ Render failed</span>
+                              <span className="text-[10px] text-red-400">{o.render_metadata.error}</span>
+                            </div>
+                          ) : (
+                            <div className="flex aspect-video w-full items-center justify-center gap-3 text-xs text-slate-400">
+                              <SpinningDisc size={40} fast glow={false} /> rendering…
+                            </div>
+                          )}
+                        </div>
+                        {o.download_url && (
+                          <a href={o.download_url} download className="btn-primary mt-4 w-full">
+                            ⬇ Download
+                          </a>
+                        )}
                       </div>
-                    )}
-                    <div className="mt-3 flex gap-2">
-                      {o.download_url && (
-                        <a
-                          href={o.download_url}
-                          download
-                          className="flex-1 rounded-lg border border-border bg-surface2 py-2 text-center text-xs font-medium transition hover:border-accent"
-                        >
-                          ⬇ Download
-                        </a>
-                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
         )}
+        </div>
       </div>
     </main>
+  );
+}
+
+function QualityRing({ score }: { score: number }) {
+  const r = 18;
+  const c = 2 * Math.PI * r;
+  const pct = Math.max(0, Math.min(100, score)) / 100;
+  const color = score >= 80 ? "#56cfb2" : score >= 70 ? "#f5a623" : "#e96b8c";
+  return (
+    <div className="relative flex h-12 w-12 items-center justify-center" title="Heuristic quality score">
+      <svg className="absolute inset-0 -rotate-90" viewBox="0 0 44 44">
+        <circle cx="22" cy="22" r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="4" />
+        <circle
+          cx="22"
+          cy="22"
+          r={r}
+          fill="none"
+          stroke={color}
+          strokeWidth="4"
+          strokeLinecap="round"
+          strokeDasharray={c}
+          strokeDashoffset={c * (1 - pct)}
+          style={{ transition: "stroke-dashoffset 1s ease" }}
+        />
+      </svg>
+      <span className="text-[11px] font-bold">{Math.round(score)}</span>
+    </div>
   );
 }

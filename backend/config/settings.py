@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -49,10 +49,21 @@ class Settings(BaseSettings):
 
     # ── Anthropic / Claude ────────────────────────────────────────────────────
     ANTHROPIC_API_KEY: str = ""
-    CLAUDE_STORY_MODEL: str = "claude-sonnet-4-6"
-    CLAUDE_EDIT_MODEL: str = "claude-sonnet-4-6"
+    CLAUDE_STORY_MODEL: str = "claude-sonnet-5"
+    CLAUDE_EDIT_MODEL: str = "claude-sonnet-5"
     CLAUDE_FAST_MODEL: str = "claude-haiku-4-5-20251001"
     CLAUDE_MAX_TOKENS: int = 8192
+
+    # ── AI provider mode ──────────────────────────────────────────────────────
+    # Every AI-dependent capability (transcription, face/emotion, story &
+    # editing intelligence, chat command interpretation) goes through
+    # backend/ai/registry.py. "placeholder" (the default) never calls a model
+    # or an API — it produces honest, clearly-labeled output built from
+    # whatever real signal is already available (ffmpeg/OpenCV scores).
+    # Switch to "local" once a local model is wired in, or "cloud" once
+    # ANTHROPIC_API_KEY (above) is set and the cloud providers are implemented.
+    AI_MODE: Literal["placeholder", "local", "cloud"] = "placeholder"
+    AI_DEVICE: str = "cuda"  # used only once a "local" provider is implemented
 
     # ── FFmpeg ────────────────────────────────────────────────────────────────
     FFMPEG_PATH: str = "ffmpeg"

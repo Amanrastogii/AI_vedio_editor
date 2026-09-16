@@ -8,11 +8,79 @@
 
 html,
 body {
-  background: #0b0d14;
+  background: #07080f;
   color: #e8eaf6;
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: #272c3f #0b0d14;
+  scrollbar-color: #262a3d #07080f;
+}
+
+@layer components {
+  .glass {
+    @apply border border-white/10 bg-white/[0.04] backdrop-blur-xl;
+    box-shadow: 0 8px 40px -12px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  .text-gradient {
+    @apply bg-gradient-to-r from-accent via-accent4 to-accent3 bg-clip-text text-transparent;
+    background-size: 200% auto;
+    animation: gradient-x 6s ease infinite;
+  }
+
+  .btn-primary {
+    @apply relative inline-flex items-center justify-center gap-2 overflow-hidden rounded-xl px-5 py-2.5 text-sm font-semibold text-white transition-all duration-300 disabled:cursor-not-allowed disabled:opacity-50;
+    background-image: linear-gradient(110deg, #7c83f5, #e96b8c, #7c83f5);
+    background-size: 200% auto;
+    box-shadow: 0 8px 24px -8px rgba(124, 131, 245, 0.6);
+  }
+  .btn-primary:not(:disabled):hover {
+    background-position: right center;
+    transform: translateY(-1px);
+    box-shadow: 0 12px 32px -8px rgba(233, 107, 140, 0.6);
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 transition-all duration-200 hover:border-accent/60 hover:bg-accent/10 hover:text-white;
+  }
+
+  .input-field {
+    @apply w-full rounded-xl border border-white/10 bg-black/30 px-4 py-2.5 text-sm text-slate-100 outline-none transition-all duration-200 placeholder:text-slate-500 focus:border-accent focus:bg-black/40 focus:ring-4 focus:ring-accent/15;
+  }
+
+  .card-hover {
+    @apply transition-all duration-300 hover:-translate-y-1 hover:border-accent/40;
+  }
+  .card-hover:hover {
+    box-shadow: 0 20px 50px -20px rgba(124, 131, 245, 0.45);
+  }
+
+  .grid-pattern {
+    background-image: linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+  }
+}
+
+/* Used by .text-gradient directly (Tailwind only emits config keyframes for used animate-* classes). */
+@keyframes gradient-x {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

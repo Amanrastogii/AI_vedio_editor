@@ -143,8 +143,9 @@ async def list_clips(
     for clip in clips:
         thumb_url = None
         if clip.thumbnail_s3_key:
-            thumb_url = await s3_client.generate_presigned_url(
-                settings.S3_BUCKET_ASSETS, clip.thumbnail_s3_key
+            thumb_url = (
+                local_storage.public_url(clip.thumbnail_s3_key) if settings.LOCAL_MODE
+                else await s3_client.generate_presigned_url(settings.S3_BUCKET_ASSETS, clip.thumbnail_s3_key)
             )
         cr = ClipResponse.model_validate(clip)
         cr.thumbnail_url = thumb_url
@@ -171,7 +172,10 @@ async def delete_clip(
     if not clip or clip.project_id != project_id:
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    await s3_client.delete_object(clip.s3_bucket, clip.s3_key)
+    if settings.LOCAL_MODE or clip.s3_bucket == "local":
+        local_storage.delete(clip.s3_key)
+    else:
+        await s3_client.delete_object(clip.s3_bucket, clip.s3_key)
     # DB cascade deletes via FK
     async with db as session:
         await session.delete(clip)

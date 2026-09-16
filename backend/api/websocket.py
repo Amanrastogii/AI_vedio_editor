@@ -9,12 +9,15 @@ real-time progress events from all 11 agents.
 """
 import asyncio
 import logging
+import uuid
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from jose import JWTError, jwt
 
 from backend.config import settings
 from backend.core.event_bus import EventBus
+from backend.database.db import AsyncSessionLocal
+from backend.database.repositories import ProjectRepository
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -29,11 +32,25 @@ async def project_websocket(
     # Authenticate before accepting.
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        if not payload.get("sub"):
+        user_id_str = payload.get("sub")
+        if not user_id_str:
             await websocket.close(code=4001, reason="Invalid token")
             return
     except JWTError:
         await websocket.close(code=4001, reason="Invalid token")
+        return
+
+    # Verify the token's user actually owns this project (REST routes already
+    # enforce this; the socket previously let any valid JWT subscribe to any
+    # project's channel).
+    try:
+        async with AsyncSessionLocal() as session:
+            project = await ProjectRepository(session).get(uuid.UUID(project_id))
+        if not project or str(project.user_id) != user_id_str:
+            await websocket.close(code=4003, reason="Not authorized for this project")
+            return
+    except ValueError:
+        await websocket.close(code=4004, reason="Invalid project id")
         return
 
     await websocket.accept()

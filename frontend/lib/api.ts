@@ -61,6 +61,7 @@ export interface Clip {
   file_size_bytes: number | null;
   upload_order: number;
   is_ingested: boolean;
+  thumbnail_url?: string | null;
 }
 export interface AgentTaskStatus {
   agent: string;
@@ -69,6 +70,8 @@ export interface AgentTaskStatus {
   started_at: string | null;
   completed_at: string | null;
   error: string | null;
+  current_message?: string | null;
+  result_metadata?: Record<string, any> | null;
 }
 export interface PipelineStatus {
   project_id: string;
@@ -76,13 +79,37 @@ export interface PipelineStatus {
   agents: AgentTaskStatus[];
 }
 export interface StoryEntry {
+  id: string;
   position: number;
   narrative_role: string;
   segment_id: string | null;
+  clip_id: string | null;
+  thumbnail_url: string | null;
+  start_ms: number | null;
+  end_ms: number | null;
   trim_start_ms: number | null;
   trim_end_ms: number | null;
   transition_in: string;
   edit_reasoning: string | null;
+}
+export interface Segment {
+  id: string;
+  clip_id: string;
+  start_ms: number;
+  end_ms: number;
+  segment_type: string;
+  quality_score: number | null;
+  engagement_score: number | null;
+  has_face: boolean;
+  keyframe_url: string | null;
+  on_timeline: boolean;
+}
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  action_json: Record<string, any> | null;
+  created_at: string;
 }
 export interface Output {
   id: string;
@@ -94,6 +121,7 @@ export interface Output {
   file_size_bytes: number | null;
   quality_score: number | null;
   download_url: string | null;
+  render_metadata: Record<string, any> | null;
 }
 
 // ── Health ──────────────────────────────────────────────────────────────────
@@ -197,6 +225,79 @@ export async function getStory(projectId: string) {
     cache: "no-store",
   });
   return handle<StoryEntry[]>(res);
+}
+
+// ── Manual editing (timeline) ─────────────────────────────────────────────────
+export async function getSegments(projectId: string) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/segments`, {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  return handle<Segment[]>(res);
+}
+export async function addStoryEntry(projectId: string, segmentId: string) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/story`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ segment_id: segmentId }),
+  });
+  return handle<StoryEntry>(res);
+}
+export async function updateStoryEntry(
+  projectId: string,
+  entryId: string,
+  patch: Partial<{
+    trim_start_ms: number;
+    trim_end_ms: number;
+    transition_in: string;
+  }>
+) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/story/${entryId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(patch),
+  });
+  return handle<StoryEntry>(res);
+}
+export async function deleteStoryEntry(projectId: string, entryId: string) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/story/${entryId}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  return handle<void>(res);
+}
+export async function reorderStory(projectId: string, entryIds: string[]) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/story/reorder`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ entry_ids: entryIds }),
+  });
+  return handle<StoryEntry[]>(res);
+}
+export async function renderTimeline(projectId: string, outputFormats?: string[]) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/render`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(outputFormats ? { output_formats: outputFormats } : {}),
+  });
+  return handle<{ total_duration_ms: number; any_failed: boolean; qa_passed: boolean }>(res);
+}
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+export async function getChatHistory(projectId: string) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/chat`, {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  return handle<ChatMessage[]>(res);
+}
+export async function sendChatMessage(projectId: string, message: string) {
+  const res = await fetch(`${API_URL}/api/v1/projects/${projectId}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ message }),
+  });
+  return handle<ChatMessage>(res);
 }
 
 // ── Outputs ───────────────────────────────────────────────────────────────────

@@ -52,6 +52,12 @@ def exists(key: str) -> bool:
     return _full(key).exists()
 
 
+def delete(key: str) -> None:
+    p = _full(key)
+    if p.exists():
+        p.unlink()
+
+
 def file_size(key: str) -> int:
     p = _full(key)
     return p.stat().st_size if p.exists() else 0

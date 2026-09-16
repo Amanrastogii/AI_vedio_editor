@@ -4,8 +4,15 @@ LOCAL_MODE pipeline — runs all 11 agents in-process as an asyncio task.
 This is the orchestrator used on localhost when the heavy ML stack / GPU / Celery
 are unavailable. It performs the REAL pipeline choreography (ordering, the two
 parallel groups, DB writes, per-agent status, the EDL/story structures, output
-creation) and emits REAL WebSocket events — but the per-agent "analysis" is
-simulated with realistic timing and plausible data instead of calling the models.
+creation) with REAL media operations wherever no AI model is required
+(ffprobe/ffmpeg/PySceneDetect/OpenCV — see backend/core/real_ops.py).
+
+Capabilities that do need an AI model (transcription, face/emotion vision,
+narrative reasoning, editing-style decisions, chat command interpretation) go
+through backend/ai/registry.py. The default provider ("placeholder") never
+fakes a realistic-looking result with random data — it returns an honest,
+clearly-labeled placeholder built from whatever real signal already exists,
+ready to be swapped for a local model or a cloud API later.
 
 The production path (Celery + real agents in backend/agents/*) is unchanged.
 """
@@ -13,9 +20,9 @@ import asyncio
 import logging
 import random
 import uuid
-from datetime import datetime, timezone
 from typing import Dict, List
 
+from backend.ai import registry as ai
 from backend.config import settings
 from backend.core.event_bus import EventBus
 from backend.database.db import AsyncSessionLocal
@@ -54,12 +61,6 @@ OUTPUT_SPECS = {
     "linkedin": (1920, 1080, "16:9"),
 }
 
-SAMPLE_WORDS = (
-    "so today I want to show you something really exciting that completely "
-    "changed how we think about this whole process and honestly the results "
-    "speak for themselves let me walk you through exactly what happened"
-).split()
-
 _db_lock = asyncio.Lock()  # serialize SQLite writes
 
 
@@ -88,7 +89,9 @@ class LocalPipeline:
             )
 
     async def _run_steps(self, key: str, label: str, steps: List[str], step_delay=(0.4, 0.9)):
-        """Emit running + progress events across `steps` messages."""
+        """Emit running + progress events across `steps` messages, persisting
+        each step's percent/message so a page reload (HTTP polling, no
+        WebSocket) still shows real mid-run progress, not just 0/100."""
         task_id = await self._agent_task(key)
         await self._emit({"event": "agent.started", "agent": key, "label": label})
         n = len(steps)
@@ -98,6 +101,10 @@ class LocalPipeline:
                 "event": "agent.progress", "agent": key, "label": label,
                 "status": "running", "progress_pct": pct, "message": msg,
             })
+            async with _db_lock, AsyncSessionLocal() as session:
+                await AgentTaskRepository(session).update_status(
+                    task_id, AgentStatus.RUNNING, progress_pct=pct, current_message=msg,
+                )
             await asyncio.sleep(random.uniform(*step_delay))
         return task_id
 
@@ -151,7 +158,7 @@ class LocalPipeline:
                 await asyncio.to_thread(real_ops.extract_thumbnail, local_path, local_storage._full(thumb_key))
                 await repo.update_video_info(
                     clip.id,
-                    duration_ms=meta.get("duration_ms") or clip.duration_ms or random.randint(45_000, 180_000),
+                    duration_ms=meta.get("duration_ms") or clip.duration_ms or 60_000,
                     fps=meta.get("fps") or clip.fps or 30.0,
                     width=meta.get("width") or clip.width or 1920,
                     height=meta.get("height") or clip.height or 1080,
@@ -197,7 +204,7 @@ class LocalPipeline:
                     q = await asyncio.to_thread(
                         real_ops.keyframe_and_quality,
                         local_path, (start_ms + end_ms) // 2, local_storage._full(kf_key)
-                    ) if local_path.exists() else round(random.uniform(0.5, 0.9), 2)
+                    ) if local_path.exists() else 0.5
                     clip_segs.append({
                         "id": seg_id,
                         "clip_id": clip.id,
@@ -227,60 +234,60 @@ class LocalPipeline:
         # ── Agent 6: Story Builder ────────────────────────────────────────────
         t = await self._run_steps("story_builder", "Story Builder", [
             "Aggregating analysis from all agents",
-            "Claude: identifying narrative arc",
-            "Selecting best segments by engagement",
+            "Ranking segments by quality + engagement",
+            "Selecting best segments",
             "Assigning hook → climax → resolution roles",
         ])
         story_len = await self._build_story(pid, all_segments)
-        await self._finish_task(t, {"segments_in_story": story_len})
+        await self._finish_task(t, {"segments_in_story": story_len, "ai_mode": settings.AI_MODE})
         await self._emit({"event": "agent.completed", "agent": "story_builder",
                           "summary": f"{story_len}-beat narrative built"})
 
         # ── Agent 7: Editing Decision ─────────────────────────────────────────
         t = await self._run_steps("editing_decision", "Editing Decision", [
-            "Claude: computing frame-accurate cut points",
+            "Computing frame-accurate cut points",
             "Choosing transitions & pacing rhythm",
             "Planning zoom / reframe per beat",
             "Emitting Edit Decision List (EDL)",
         ])
-        await self._finish_task(t, {"color_grade": "cinematic_warm", "pacing": "dynamic"})
+        edit_decision = await self._decide_editing(pid, story_len)
+        await self._finish_task(t, {"color_grade": edit_decision.color_grade, "pacing": edit_decision.pacing,
+                                     "ai_mode": settings.AI_MODE})
         await self._emit({"event": "agent.completed", "agent": "editing_decision",
-                          "summary": "EDL ready · cinematic_warm"})
+                          "summary": f"EDL ready · {edit_decision.color_grade}"})
 
         # ── Agents 8,9: parallel (audio + subtitle) ───────────────────────────
         await self._emit({"event": "group.started", "agents": ["audio_enhancement", "subtitle"],
                           "label": "Parallel post-production"})
         await self._audio_agent()
-        await self._subtitle_agent(word_total)
+        await self._subtitle_agent(pid)
 
         # ── Agent 10: Rendering ───────────────────────────────────────────────
         formats = self.project_formats or settings.OUTPUT_FORMATS
         t = await self._run_steps("rendering", "Rendering", [
             "Building FFmpeg filter graph from EDL",
-            "Applying color grade (LUT) + stabilization",
+            "Applying loudness normalization",
             f"Rendering {len(formats)} formats: {', '.join(formats)}",
-            "Uploading outputs",
+            "Finalizing outputs",
         ], step_delay=(0.6, 1.1))
-        total_dur = await self._create_outputs(pid, primary_clip_key, formats)
-        await self._finish_task(t, {"formats": formats})
+        total_dur, any_failed = await self._create_outputs(pid, formats)
+        await self._finish_task(t, {"formats": formats, "any_failed": any_failed})
         await self._emit({"event": "agent.completed", "agent": "rendering",
-                          "summary": f"{len(formats)} formats rendered"})
+                          "summary": f"{len(formats)} formats rendered" + (" (some failed)" if any_failed else "")})
 
         # ── Agent 11: QA ──────────────────────────────────────────────────────
         t = await self._run_steps("quality_assurance", "Quality Assurance", [
-            "Scoring perceptual quality (VMAF)",
-            "Checking A/V sync + artifacts",
-            "Validating aspect ratios",
+            "Checking file integrity",
+            "Scanning for black frames",
+            "Scoring bitrate-based quality heuristic",
             "Finalizing project",
         ])
+        all_passed = await self._qa_outputs(pid)
         async with _db_lock, AsyncSessionLocal() as session:
-            outs = await OutputRepository(session).list_for_project(pid)
-            for o in outs:
-                await OutputRepository(session).update(o.id, quality_score=round(random.uniform(82, 94), 1))
             await ProjectRepository(session).update_status(pid, ProjectStatus.COMPLETED)
-        await self._finish_task(t, {"all_passed": True})
+        await self._finish_task(t, {"all_passed": all_passed})
         await self._emit({"event": "agent.completed", "agent": "quality_assurance",
-                          "summary": "QA passed"})
+                          "summary": "QA passed" if all_passed else "QA found issues"})
 
         await self._emit({
             "event": "pipeline.complete",
@@ -297,8 +304,9 @@ class LocalPipeline:
     # ── Parallel-group agents ─────────────────────────────────────────────────
 
     async def _speech_agent(self, clips) -> int:
+        provider = ai.get_transcription_provider()
         t = await self._run_steps("speech_analysis", "Speech Analysis", [
-            "WhisperX: transcribing audio",
+            "Transcribing audio",
             "Word-level timestamp alignment",
             "Speaker diarization",
             "Flagging filler words & silence",
@@ -307,73 +315,75 @@ class LocalPipeline:
         async with _db_lock, AsyncSessionLocal() as session:
             tr_repo = TranscriptRepository(session)
             for clip in clips:
-                dur = clip.duration_ms or 90_000
-                rows, cursor = [], 0
-                while cursor < dur - 2000:
-                    w = random.choice(SAMPLE_WORDS)
-                    wlen = random.randint(180, 420)
-                    rows.append({
-                        "clip_id": clip.id, "speaker_id": "SPEAKER_00", "word": w,
-                        "start_ms": cursor, "end_ms": cursor + wlen,
-                        "confidence": round(random.uniform(0.8, 0.99), 2),
-                        "is_filler": w in ("so", "honestly"), "is_silence": False,
-                    })
-                    cursor += wlen + random.randint(40, 160)
-                await tr_repo.bulk_create(rows)
-                total += len(rows)
-        await self._finish_task(t, {"words": total})
-        await self._emit({"event": "agent.completed", "agent": "speech_analysis",
-                          "summary": f"{total} words transcribed"})
+                local_path = local_storage._full(clip.s3_key)
+                result = await provider.transcribe(
+                    local_path if local_path.exists() else None, clip.duration_ms or 0
+                )
+                if result.words:
+                    rows = [{
+                        "clip_id": clip.id, "speaker_id": "SPEAKER_00", "word": w.word,
+                        "start_ms": w.start_ms, "end_ms": w.end_ms,
+                        "confidence": w.confidence, "is_filler": w.is_filler, "is_silence": w.is_silence,
+                    } for w in result.words]
+                    await tr_repo.bulk_create(rows)
+                    total += len(rows)
+        summary = f"{total} words transcribed" if total else "transcription pending — no provider configured"
+        await self._finish_task(t, {"words": total, "ai_mode": settings.AI_MODE})
+        await self._emit({"event": "agent.completed", "agent": "speech_analysis", "summary": summary})
         return total
 
     async def _face_agent(self, segments) -> None:
+        provider = ai.get_vision_provider()
         t = await self._run_steps("face_detection", "Face Detection", [
-            "InsightFace: detecting & tracking faces",
+            "Detecting & tracking faces",
             "Scoring face quality (sharpness, frontality)",
             "Identifying main subjects",
         ])
+        faces = 0
         async with _db_lock, AsyncSessionLocal() as session:
             seg_repo = SegmentRepository(session)
-            faces = 0
             for s in segments:
-                has = random.random() > 0.35
-                if has:
+                kf_path = local_storage._full(s["keyframe_s3_key"]) if s.get("keyframe_s3_key") else None
+                vision = await provider.analyze(kf_path if kf_path and kf_path.exists() else None)
+                if vision.has_face is None:
+                    continue  # unknown — don't fabricate a value or inflate engagement
+                if vision.has_face:
                     faces += 1
-                await seg_repo.update_scores(
-                    s["id"], has_face=has, face_count=random.randint(1, 2) if has else 0,
-                    engagement_score=min(1.0, (s["engagement_score"] or 0.4) + (0.2 if has else 0)),
-                )
-        await self._finish_task(t, {"segments_with_faces": faces})
-        await self._emit({"event": "agent.completed", "agent": "face_detection",
-                          "summary": f"faces in {faces} segments"})
+                await seg_repo.update_scores(s["id"], has_face=True, face_count=vision.face_count or 1)
+        summary = f"faces in {faces} segments" if faces or provider.__class__.__name__ != "PlaceholderVisionProvider" \
+            else "face detection pending — no provider configured"
+        await self._finish_task(t, {"segments_with_faces": faces, "ai_mode": settings.AI_MODE})
+        await self._emit({"event": "agent.completed", "agent": "face_detection", "summary": summary})
 
     async def _emotion_agent(self, segments) -> int:
+        provider = ai.get_vision_provider()
         t = await self._run_steps("emotion_analysis", "Emotion Analysis", [
-            "DeepFace: per-frame emotion",
-            "Wav2Vec2: audio sentiment",
+            "Per-frame emotion analysis",
+            "Audio sentiment analysis",
             "Locating emotional peaks",
         ])
         peaks = 0
+        determined = False
         async with _db_lock, AsyncSessionLocal() as session:
             seg_repo = SegmentRepository(session)
             for s in segments:
-                happy = round(random.uniform(0, 1), 2)
-                surprise = round(random.uniform(0, 0.6), 2)
-                if happy > 0.6 or surprise > 0.4:
+                kf_path = local_storage._full(s["keyframe_s3_key"]) if s.get("keyframe_s3_key") else None
+                vision = await provider.analyze(kf_path if kf_path and kf_path.exists() else None)
+                if not vision.emotion_labels:
+                    continue  # unknown — don't fabricate scores
+                determined = True
+                happy = vision.emotion_labels.get("happy", 0)
+                if happy > 0.6:
                     peaks += 1
-                await seg_repo.update_scores(
-                    s["id"],
-                    emotion_labels={"happy": happy, "surprise": surprise,
-                                    "neutral": round(1 - happy, 2)},
-                    engagement_score=min(1.0, (s["engagement_score"] or 0.4) + happy * 0.2),
-                )
-        await self._finish_task(t, {"emotional_peaks": peaks})
-        await self._emit({"event": "agent.completed", "agent": "emotion_analysis",
-                          "summary": f"{peaks} emotional peaks"})
+                await seg_repo.update_scores(s["id"], emotion_labels=vision.emotion_labels)
+        summary = f"{peaks} emotional peaks" if determined else "emotion analysis pending — no provider configured"
+        await self._finish_task(t, {"emotional_peaks": peaks, "ai_mode": settings.AI_MODE})
+        await self._emit({"event": "agent.completed", "agent": "emotion_analysis", "summary": summary})
         return peaks
 
     async def _build_story(self, pid, segments) -> int:
-        # pick top segments by engagement
+        provider = ai.get_story_provider()
+        # pick top segments by real quality/engagement signal
         async with AsyncSessionLocal() as session:
             highlights = await SegmentRepository(session).get_highlights(pid, min_score=0.0)
         top = sorted(highlights, key=lambda s: (s.engagement_score or 0), reverse=True)[:8]
@@ -382,53 +392,80 @@ class LocalPipeline:
                  NarrativeRole.RESOLUTION, NarrativeRole.BROLL]
         rows = []
         for i, seg in enumerate(top):
+            beat = await provider.build_beat(
+                i, seg.quality_score or 0.5, seg.engagement_score or 0.5, seg.has_face
+            )
             rows.append({
                 "project_id": pid,
                 "segment_id": seg.id,
                 "position_order": i + 1,
                 "narrative_role": roles[i % len(roles)],
-                "transition_in": TransitionType.CUT if i == 0 else random.choice(
-                    [TransitionType.CUT, TransitionType.DISSOLVE, TransitionType.CROSS_FADE]),
+                "transition_in": TransitionType.CUT if i == 0 else TransitionType(beat.transition_in),
                 "trim_start_ms": seg.start_ms,
                 "trim_end_ms": seg.end_ms,
-                "edit_reasoning": random.choice([
-                    "Strong opening energy, direct eye contact",
-                    "Key context for the story",
-                    "Builds tension toward the payoff",
-                    "Highest emotional peak in the footage",
-                    "Natural resolution beat",
-                ]),
+                "edit_reasoning": beat.edit_reasoning,
             })
         if rows:
             async with _db_lock, AsyncSessionLocal() as session:
                 await StoryTimelineRepository(session).bulk_create(rows)
         return len(rows)
 
+    async def _decide_editing(self, pid, beat_count: int):
+        provider = ai.get_edit_decision_provider()
+        async with AsyncSessionLocal() as session:
+            timeline = await StoryTimelineRepository(session).get_ordered(pid)
+        scored = [e.segment for e in timeline if e.segment]
+        avg_quality = sum((s.quality_score or 0.5) for s in scored) / len(scored) if scored else 0.5
+        avg_engagement = sum((s.engagement_score or 0.5) for s in scored) / len(scored) if scored else 0.5
+        return await provider.decide(avg_quality, avg_engagement, beat_count)
+
     async def _audio_agent(self) -> None:
         t = await self._run_steps("audio_enhancement", "Audio Enhancement", [
-            "DeepFilterNet: noise reduction",
-            "Normalizing loudness to -14 LUFS",
-            "Removing silence & filler cuts",
-            "Ducking background music under speech",
+            "Planning loudness normalization to -14 LUFS",
+            "Identifying silence & filler cuts",
+            "Preparing music ducking plan",
         ])
-        await self._finish_task(t, {"lufs": -14.0})
+        # The actual ffmpeg loudnorm filter runs during rendering (real_ops.render_edit)
+        # so it's applied exactly once, on the final concatenated audio track.
+        await self._finish_task(t, {"lufs_target": -14.0, "method": "ffmpeg loudnorm (applied at render)"})
         await self._emit({"event": "agent.completed", "agent": "audio_enhancement",
-                          "summary": "audio enhanced · -14 LUFS"})
+                          "summary": "loudness normalization planned · -14 LUFS at render"})
 
-    async def _subtitle_agent(self, words) -> None:
-        t = await self._run_steps("subtitle", "Subtitle", [
-            "Building cues from transcript",
-            "Word-level highlight styling",
-            "Exporting SRT / VTT",
-        ])
+    async def _write_subtitles(self, pid) -> int:
+        """Build+save the SRT from the current timeline. Shared by the full
+        pipeline run and by rerender(), so subtitles never go stale after a
+        manual edit or chat command changes the timeline."""
+        async with AsyncSessionLocal() as session:
+            timeline = await StoryTimelineRepository(session).get_ordered(pid)
+
+        cues = []
+        cursor_ms = 0
+        for entry in timeline:
+            if not entry.segment:
+                continue
+            start = entry.trim_start_ms if entry.trim_start_ms is not None else entry.segment.start_ms
+            end = entry.trim_end_ms if entry.trim_end_ms is not None else entry.segment.end_ms
+            dur = max(300, end - start)
+            cues.append((cursor_ms, cursor_ms + dur, "[Transcript pending — connect a transcription provider]"))
+            cursor_ms += dur
+
+        srt = real_ops.build_srt(cues) if cues else ""
         key = local_storage.make_subtitle_key(self.project_id, "main", "srt")
-        await local_storage.save_bytes(
-            key, b"1\n00:00:00,000 --> 00:00:03,000\nAuto-generated subtitles (local mode)\n")
-        await self._finish_task(t, {"subtitle_key": key})
-        await self._emit({"event": "agent.completed", "agent": "subtitle",
-                          "summary": "SRT/VTT generated"})
+        await local_storage.save_bytes(key, srt.encode("utf-8"))
+        return len(cues)
 
-    async def _create_outputs(self, pid, primary_clip_key, formats) -> int:
+    async def _subtitle_agent(self, pid) -> None:
+        t = await self._run_steps("subtitle", "Subtitle", [
+            "Building cues from the edit timeline",
+            "Aligning cue timing to rendered output",
+            "Exporting SRT",
+        ])
+        cue_count = await self._write_subtitles(pid)
+        await self._finish_task(t, {"cue_count": cue_count})
+        await self._emit({"event": "agent.completed", "agent": "subtitle",
+                          "summary": f"{cue_count} cues generated (SRT)"})
+
+    async def _create_outputs(self, pid, formats):
         # Build the real edit segment list from the story timeline.
         async with AsyncSessionLocal() as session:
             timeline = await StoryTimelineRepository(session).get_ordered(pid)
@@ -445,7 +482,8 @@ class LocalPipeline:
                 end = entry.trim_end_ms if entry.trim_end_ms is not None else entry.segment.end_ms
                 edit_segments.append({"src": str(src), "start_ms": int(start), "end_ms": int(end)})
 
-        total_dur = sum(s["end_ms"] - s["start_ms"] for s in edit_segments) or random.randint(60_000, 140_000)
+        total_dur = sum(s["end_ms"] - s["start_ms"] for s in edit_segments)
+        any_failed = False
 
         async with _db_lock, AsyncSessionLocal() as session:
             out_repo = OutputRepository(session)
@@ -461,7 +499,7 @@ class LocalPipeline:
                     "message": f"ffmpeg encoding {fmt} ({w}×{h}) — {len(edit_segments)} cuts",
                 })
 
-                # REAL ffmpeg render: trim + scale/pad + concat the chosen segments.
+                # REAL ffmpeg render: trim + scale/pad + concat + loudnorm.
                 rendered = False
                 if edit_segments:
                     try:
@@ -473,28 +511,49 @@ class LocalPipeline:
 
                 if rendered and out_path.exists():
                     s3_key, size, meta = out_key, local_storage.file_size(out_key), {"real_render": True}
-                    # measure rendered duration for accuracy
                     probe = await asyncio.to_thread(real_ops.probe_metadata, out_path)
                     if probe.get("duration_ms"):
                         total_dur = probe["duration_ms"]
                 else:
-                    # Fallback: reference the source clip so the player still works.
-                    s3_key = primary_clip_key or ""
-                    size = local_storage.file_size(primary_clip_key) if primary_clip_key else 0
-                    meta = {"real_render": False, "fallback_source": True}
+                    # Honest failure — do NOT ship the raw source clip as if it
+                    # were the edited output. The frontend shows this as failed.
+                    any_failed = True
+                    s3_key, size = None, 0
+                    meta = {"real_render": False, "error": "no edit segments" if not edit_segments else "ffmpeg render failed"}
 
-                await out_repo.create(
-                    project_id=pid,
-                    format=OutputFormat(fmt),
+                existing = await out_repo.get_by_format(pid, OutputFormat(fmt))
+                fields = dict(
                     aspect_ratio=ratio, width=w, height=h,
-                    duration_ms=total_dur,
-                    file_size_bytes=size,
-                    s3_key=s3_key,
-                    s3_bucket="local",
-                    quality_score=None,
-                    render_metadata=meta,
+                    duration_ms=total_dur, file_size_bytes=size,
+                    s3_key=s3_key, s3_bucket="local",
+                    quality_score=None, render_metadata=meta,
                 )
-        return total_dur
+                if existing:
+                    await out_repo.update(existing.id, **fields)
+                else:
+                    await out_repo.create(project_id=pid, format=OutputFormat(fmt), **fields)
+        return total_dur, any_failed
+
+    async def _qa_outputs(self, pid) -> bool:
+        all_passed = True
+        async with _db_lock, AsyncSessionLocal() as session:
+            out_repo = OutputRepository(session)
+            outs = await out_repo.list_for_project(pid)
+            for o in outs:
+                if not o.s3_key:
+                    all_passed = False
+                    continue
+                path = local_storage._full(o.s3_key)
+                if not path.exists():
+                    all_passed = False
+                    continue
+                check = await asyncio.to_thread(real_ops.check_output_integrity, path)
+                if not check["integrity_ok"] or check["black_ms"] > 2000:
+                    all_passed = False
+                meta = dict(o.render_metadata or {})
+                meta["qa"] = check
+                await out_repo.update(o.id, quality_score=check["heuristic_quality_score"], render_metadata=meta)
+        return all_passed
 
     project_formats: List[str] | None = None
 
@@ -506,3 +565,18 @@ def launch(project_id: str, formats: List[str] | None = None) -> None:
     pipeline = LocalPipeline(project_id)
     pipeline.project_formats = formats
     asyncio.create_task(pipeline.run())
+
+
+async def rerender(project_id: str, formats: List[str] | None = None) -> Dict:
+    """
+    Re-render outputs from the CURRENT story timeline without re-running the
+    AI analysis stages — used after a manual timeline edit or a chat command.
+    """
+    pipeline = LocalPipeline(project_id)
+    pid = uuid.UUID(project_id)
+    fmts = formats or settings.OUTPUT_FORMATS
+    await pipeline._write_subtitles(pid)
+    total_dur, any_failed = await pipeline._create_outputs(pid, fmts)
+    all_passed = await pipeline._qa_outputs(pid)
+    await pipeline.bus.close()
+    return {"total_duration_ms": total_dur, "any_failed": any_failed, "qa_passed": all_passed}
