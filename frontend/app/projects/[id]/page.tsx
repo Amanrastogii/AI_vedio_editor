@@ -12,11 +12,15 @@ import {
   Clip,
   Output,
   Project,
+  StyleProfile,
   getProject,
   getToken,
+  ingestUploaded,
   listClips,
   listOutputs,
+  listStyles,
   startProcessing,
+  updateProject,
   uploadClip,
 } from "@/lib/api";
 
@@ -40,8 +44,39 @@ export default function ProjectPage() {
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  const [styles, setStyles] = useState<StyleProfile[]>([]);
   const [error, setError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    listStyles().then((all) => setStyles(all.filter((s) => s.status === "ready"))).catch(() => {});
+  }, []);
+
+  async function chooseStyle(profileId: string) {
+    if (!project) return;
+    const target_style = { ...(project.target_style || {}) };
+    if (profileId) target_style.style_profile_id = profileId;
+    else delete target_style.style_profile_id;
+    try {
+      setProject(await updateProject(id, { target_style }));
+    } catch (e: any) {
+      setError(e.message || "Couldn't update the style");
+    }
+  }
+
+  async function handleManual() {
+    setPreparing(true);
+    setError("");
+    try {
+      await ingestUploaded(id);
+      setTab("edit");
+    } catch (e: any) {
+      setError(e.message || "Couldn't prepare clips");
+    } finally {
+      setPreparing(false);
+    }
+  }
 
   async function load() {
     try {
@@ -126,9 +161,9 @@ export default function ProjectPage() {
       <AnimatedBackground />
       <AppHeader title={project.title} subtitle={project.status} backHref="/" />
 
-      <div className="mx-auto max-w-6xl px-6 py-8">
+      <div className={`mx-auto px-6 py-8 ${tab === "edit" ? "max-w-[1600px]" : "max-w-6xl"}`}>
         {/* Tabs */}
-        <div className="glass sticky top-[68px] z-10 mb-6 grid animate-fade-up grid-cols-4 gap-1 rounded-2xl p-1.5">
+        <div className="glass sticky top-[68px] z-10 mx-auto mb-6 grid max-w-6xl animate-fade-up grid-cols-4 gap-1 rounded-2xl p-1.5">
           {TABS.map((t) => {
             const active = tab === t.key;
             return (
@@ -256,20 +291,43 @@ export default function ProjectPage() {
                 </div>
 
                 {canUpload && (
-                  <button
-                    onClick={handleProcess}
-                    disabled={processing}
-                    className="btn-primary mt-8 w-full py-4 text-base"
-                  >
-                    {processing ? (
-                      <>
-                        <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                        Starting the pipeline…
-                      </>
-                    ) : (
-                      "🚀 Start AI editing — run the 11-agent pipeline"
-                    )}
-                  </button>
+                  <>
+                    <div className="glass mt-8 flex flex-col gap-3 rounded-2xl p-4 sm:flex-row sm:items-center">
+                      <div className="flex-1">
+                        <p className="text-sm font-semibold">🎓 Edit in a learned style</p>
+                        <p className="text-xs text-slate-400">
+                          The AI cuts this footage the way that editor would — pacing, what they keep, look & sound.{" "}
+                          <a href="/styles" className="text-accent hover:underline">Train a style →</a>
+                        </p>
+                      </div>
+                      <select
+                        value={project.target_style?.style_profile_id || ""}
+                        onChange={(e) => chooseStyle(e.target.value)}
+                        className="input-field !w-auto !py-2"
+                        aria-label="Editing style"
+                      >
+                        <option value="">Default AI style</option>
+                        {styles.map((s) => (
+                          <option key={s.id} value={s.id}>{s.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto]">
+                      <button onClick={handleProcess} disabled={processing || preparing} className="btn-primary w-full py-4 text-base">
+                        {processing ? (
+                          <>
+                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                            Starting the pipeline…
+                          </>
+                        ) : (
+                          "🚀 Start AI editing — run the 11-agent pipeline"
+                        )}
+                      </button>
+                      <button onClick={handleManual} disabled={processing || preparing} className="btn-ghost justify-center !px-5 !py-4 !text-sm">
+                        {preparing ? "Preparing clips…" : "🎛 Edit manually (skip AI)"}
+                      </button>
+                    </div>
+                  </>
                 )}
               </div>
             )}

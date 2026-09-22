@@ -103,6 +103,7 @@ class ClipResponse(BaseModel):
     upload_order: int
     is_ingested: bool
     thumbnail_url: Optional[str] = None
+    source_url: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -139,6 +140,9 @@ class StoryEntryResponse(BaseModel):
     trim_end_ms: Optional[int]
     transition_in: str
     edit_reasoning: Optional[str]
+    effects: Optional[Dict[str, Any]] = None
+    reframe_params: Optional[Dict[str, Any]] = None  # {"mode": "smart"|"center"|"fit"|"manual", "x": 0..1}
+    source_url: Optional[str] = None   # raw clip file — lets the editor preview without rendering
 
     model_config = {"from_attributes": True}
 
@@ -149,6 +153,161 @@ class StoryEntryUpdate(BaseModel):
     transition_in: Optional[str] = None
     zoom_params: Optional[Dict[str, Any]] = None
     reframe_params: Optional[Dict[str, Any]] = None
+    effects: Optional[Dict[str, Any]] = None
+    narrative_role: Optional[str] = None
+
+
+class SplitRequest(BaseModel):
+    at_ms: int = Field(description="Absolute source-clip time to cut at (between trim_start and trim_end)")
+
+
+class TimelineRow(BaseModel):
+    segment_id: uuid.UUID
+    narrative_role: Optional[str] = None
+    transition_in: Optional[str] = "cut"
+    trim_start_ms: Optional[int] = None
+    trim_end_ms: Optional[int] = None
+    effects: Optional[Dict[str, Any]] = None
+    reframe_params: Optional[Dict[str, Any]] = None
+    edit_reasoning: Optional[str] = None
+
+
+class TimelineReplaceRequest(BaseModel):
+    rows: List[TimelineRow]
+
+
+class ClipRangeCreate(BaseModel):
+    clip_id: uuid.UUID
+    start_ms: Optional[int] = None
+    end_ms: Optional[int] = None
+
+
+class VersionCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=255)
+
+
+class VersionResponse(BaseModel):
+    id: uuid.UUID
+    label: str
+    entry_count: int
+    created_at: datetime
+
+
+class AudioTrackUpdate(BaseModel):
+    start_ms: Optional[int] = Field(None, ge=0)
+    source_offset_ms: Optional[int] = Field(None, ge=0)
+    length_ms: Optional[int] = Field(None, ge=0)
+    volume: Optional[float] = Field(None, ge=0, le=2)
+    fade_in_ms: Optional[int] = Field(None, ge=0, le=20000)
+    fade_out_ms: Optional[int] = Field(None, ge=0, le=20000)
+    loop: Optional[bool] = None
+    duck_original: Optional[float] = Field(None, ge=0, le=1)
+
+
+class AudioTrackResponse(BaseModel):
+    id: uuid.UUID
+    original_filename: str
+    duration_ms: Optional[int]
+    start_ms: int
+    source_offset_ms: int
+    length_ms: Optional[int]
+    volume: float
+    fade_in_ms: int
+    fade_out_ms: int
+    loop: bool
+    duck_original: float
+    url: Optional[str] = None
+    analysis: Optional[Dict[str, Any]] = None   # {"bpm", "beats_ms", "downbeat_phase", ...} once analysed
+
+    model_config = {"from_attributes": True}
+
+
+class TextOverlayCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=300)
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    position: str = Field("bottom", pattern="^(top|center|bottom)$")
+    font_size: int = Field(56, ge=12, le=200)
+    color: str = Field("white", pattern="^(#[0-9a-fA-F]{6}|[a-zA-Z]{3,20})$")
+    box: bool = True
+
+
+class TextOverlayUpdate(BaseModel):
+    text: Optional[str] = Field(None, min_length=1, max_length=300)
+    start_ms: Optional[int] = Field(None, ge=0)
+    end_ms: Optional[int] = Field(None, gt=0)
+    position: Optional[str] = Field(None, pattern="^(top|center|bottom)$")
+    font_size: Optional[int] = Field(None, ge=12, le=200)
+    color: Optional[str] = Field(None, pattern="^(#[0-9a-fA-F]{6}|[a-zA-Z]{3,20})$")
+    box: Optional[bool] = None
+
+
+class TextOverlayResponse(BaseModel):
+    id: uuid.UUID
+    text: str
+    start_ms: int
+    end_ms: int
+    position: str
+    font_size: int
+    color: str
+    box: bool
+
+    model_config = {"from_attributes": True}
+
+
+class ProjectUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=255)
+    target_duration_sec: Optional[int] = Field(None, gt=0, le=3600)
+    target_style: Optional[Dict[str, Any]] = None
+    output_formats: Optional[List[str]] = None
+
+
+# ── Style learning ────────────────────────────────────────────────────────────
+
+class StyleProfileCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=2000)
+
+
+class StyleAssetResponse(BaseModel):
+    id: uuid.UUID
+    kind: str
+    original_filename: str
+    duration_ms: Optional[int]
+    width: Optional[int]
+    height: Optional[int]
+
+    model_config = {"from_attributes": True}
+
+
+class StyleExampleResponse(BaseModel):
+    id: uuid.UUID
+    title: str
+    status: str
+    analysis: Optional[Dict[str, Any]]
+    error_message: Optional[str]
+    assets: List[StyleAssetResponse] = []
+    created_at: datetime
+
+
+class StyleProfileResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: Optional[str]
+    status: str
+    style: Optional[Dict[str, Any]]
+    metrics: Optional[Dict[str, Any]]
+    summary: Optional[str]
+    error_message: Optional[str]
+    trained_at: Optional[datetime]
+    created_at: datetime
+    example_count: int = 0
+    examples: Optional[List[StyleExampleResponse]] = None
+
+
+class ApplyStyleRequest(BaseModel):
+    profile_id: uuid.UUID
+    target_duration_sec: Optional[int] = Field(None, gt=0, le=3600)
 
 
 class StoryEntryCreate(BaseModel):
@@ -172,6 +331,7 @@ class SegmentResponse(BaseModel):
     has_face: bool
     keyframe_url: Optional[str] = None
     on_timeline: bool = False
+    source_url: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -184,6 +344,7 @@ class RenderResponse(BaseModel):
     total_duration_ms: int
     any_failed: bool
     qa_passed: bool
+    warnings: List[str] = []
 
 
 # ── Chat ──────────────────────────────────────────────────────────────────────

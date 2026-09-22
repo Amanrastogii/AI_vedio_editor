@@ -149,6 +149,8 @@ async def list_clips(
             )
         cr = ClipResponse.model_validate(clip)
         cr.thumbnail_url = thumb_url
+        if settings.LOCAL_MODE:
+            cr.source_url = local_storage.public_url(clip.s3_key)
         responses.append(cr)
     return responses
 

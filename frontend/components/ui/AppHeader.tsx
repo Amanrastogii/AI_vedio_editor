@@ -51,6 +51,9 @@ export default function AppHeader({ title, subtitle, backHref }: Props) {
           <div className="hidden md:block">
             <BackendStatus />
           </div>
+          <Link href="/styles" className="btn-ghost" title="Teach the AI your editing style">
+            🎓 <span className="hidden sm:inline">My styles</span>
+          </Link>
           <button onClick={logout} className="btn-ghost">
             Logout
           </button>

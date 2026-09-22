@@ -9,7 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from backend.api.routes import auth, chat, outputs, processing, projects, timeline, uploads
+from backend.api.routes import (
+    assist, auth, chat, media, outputs, processing, projects, styles, timeline, uploads,
+)
 from backend.api.websocket import router as ws_router
 from backend.config import settings
 from backend.database.db import engine
@@ -37,6 +39,12 @@ def _ensure_sqlite_columns(conn) -> None:
     if "current_message" not in existing:
         conn.execute(text("ALTER TABLE agent_tasks ADD COLUMN current_message TEXT"))
         logger.info("SQLite migration: added agent_tasks.current_message")
+    for table, column in (("story_timelines", "effects"), ("projects", "editor_settings"),
+                          ("audio_tracks", "analysis")):
+        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()}
+        if cols and column not in cols:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} JSON"))
+            logger.info("SQLite migration: added %s.%s", table, column)
 
 
 @asynccontextmanager
@@ -89,6 +97,9 @@ app.include_router(processing.router, prefix=API_PREFIX)
 app.include_router(outputs.router, prefix=API_PREFIX)
 app.include_router(timeline.router, prefix=API_PREFIX)
 app.include_router(chat.router, prefix=API_PREFIX)
+app.include_router(media.router, prefix=API_PREFIX)
+app.include_router(styles.router, prefix=API_PREFIX)
+app.include_router(assist.router, prefix=API_PREFIX)
 app.include_router(ws_router)  # WebSocket (no prefix)
 
 # Serve locally-stored clips/outputs in LOCAL_MODE (StaticFiles supports range

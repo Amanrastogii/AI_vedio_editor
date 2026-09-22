@@ -30,8 +30,9 @@ from backend.database.models import (
     AgentStatus, NarrativeRole, OutputFormat, ProjectStatus, SegmentType, TransitionType,
 )
 from backend.database.repositories import (
-    AgentTaskRepository, ClipRepository, OutputRepository,
-    ProjectRepository, SegmentRepository, StoryTimelineRepository, TranscriptRepository,
+    AgentTaskRepository, AudioTrackRepository, ClipRepository, OutputRepository,
+    ProjectRepository, SegmentRepository, StoryTimelineRepository, TextOverlayRepository,
+    TimelineVersionRepository, TranscriptRepository,
 )
 from backend.core import real_ops
 from backend.storage import local_storage
@@ -187,6 +188,15 @@ class LocalPipeline:
         async with _db_lock, AsyncSessionLocal() as session:
             seg_repo = SegmentRepository(session)
             for clip in clips:
+                # Clips already ingested by the manual editor keep their segments
+                # (and any timeline entries that reference them).
+                prior = await seg_repo.list_for_clip(clip.id)
+                if prior:
+                    all_segments.extend({
+                        "id": s.id, "clip_id": s.clip_id, "start_ms": s.start_ms, "end_ms": s.end_ms,
+                        "keyframe_s3_key": s.keyframe_s3_key, "quality_score": s.quality_score,
+                    } for s in prior)
+                    continue
                 dur = clip.duration_ms or 90_000
                 local_path = local_storage._full(clip.s3_key)
                 # REAL shot-boundary detection (off the event loop)
@@ -239,9 +249,11 @@ class LocalPipeline:
             "Assigning hook → climax → resolution roles",
         ])
         story_len = await self._build_story(pid, all_segments)
-        await self._finish_task(t, {"segments_in_story": story_len, "ai_mode": settings.AI_MODE})
+        await self._finish_task(t, {"segments_in_story": story_len, "ai_mode": settings.AI_MODE,
+                                     "style_applied": self.style_summary})
         await self._emit({"event": "agent.completed", "agent": "story_builder",
-                          "summary": f"{story_len}-beat narrative built"})
+                          "summary": f"{story_len}-beat narrative built"
+                                     + (" · in learned editor style" if self.style_summary else "")})
 
         # ── Agent 7: Editing Decision ─────────────────────────────────────────
         t = await self._run_steps("editing_decision", "Editing Decision", [
@@ -304,6 +316,31 @@ class LocalPipeline:
     # ── Parallel-group agents ─────────────────────────────────────────────────
 
     async def _speech_agent(self, clips) -> int:
+        from backend.editing import service as editing
+        if editing.transcription_available():
+            # Real local speech-to-text (faster-whisper), cached per clip.
+            t = await self._run_steps("speech_analysis", "Speech Analysis", [
+                f"Loading speech model ({settings.WHISPER_MODEL})",
+                "Transcribing audio with word timestamps",
+                "Flagging filler words",
+            ], step_delay=(0.1, 0.2))
+
+            def progress(msg: str, pct: float) -> None:
+                asyncio.ensure_future(self._emit({
+                    "event": "agent.progress", "agent": "speech_analysis", "label": "Speech Analysis",
+                    "status": "running", "progress_pct": int(pct * 100), "message": msg}))
+
+            try:
+                await editing.ensure_transcripts(uuid.UUID(self.project_id), progress=progress)
+                status = await editing.transcription_status(uuid.UUID(self.project_id))
+                total, summary = status["words"], f"{status['words']} words transcribed (faster-whisper)"
+            except Exception as e:  # noqa: BLE001 — captions are an enhancement; never fail the pipeline
+                logger.warning("transcription failed: %s", e)
+                total, summary = 0, f"transcription failed: {str(e)[:120]}"
+            await self._finish_task(t, {"words": total, "provider": f"faster-whisper:{settings.WHISPER_MODEL}"})
+            await self._emit({"event": "agent.completed", "agent": "speech_analysis", "summary": summary})
+            return total
+
         provider = ai.get_transcription_provider()
         t = await self._run_steps("speech_analysis", "Speech Analysis", [
             "Transcribing audio",
@@ -381,7 +418,41 @@ class LocalPipeline:
         await self._emit({"event": "agent.completed", "agent": "emotion_analysis", "summary": summary})
         return peaks
 
+    style_summary: str | None = None
+
     async def _build_story(self, pid, segments) -> int:
+        async with AsyncSessionLocal() as session:
+            project = await ProjectRepository(session).get(pid)
+            prior = await StoryTimelineRepository(session).get_ordered(pid)
+
+        rows = None
+        style_id = (project.target_style or {}).get("style_profile_id") if project else None
+        if style_id:
+            # Learned editor style (backend/style): trained selector + retrieval memory.
+            from backend.style.service import plan_timeline_with_style
+            try:
+                await self._emit({"event": "agent.progress", "agent": "story_builder", "label": "Story Builder",
+                                  "status": "running", "progress_pct": 90,
+                                  "message": "Applying the learned editor style"})
+                plan = await plan_timeline_with_style(pid, uuid.UUID(str(style_id)), project.target_duration_sec)
+                rows = plan["rows"]
+                self.style_summary = plan["summary"]
+            except Exception as e:  # noqa: BLE001 — style is an enhancement, never a hard failure
+                logger.warning("style planning failed for %s, using default story: %s", pid, e)
+
+        if rows is None:
+            rows = await self._default_story_rows(pid)
+
+        async with _db_lock, AsyncSessionLocal() as session:
+            repo = StoryTimelineRepository(session)
+            if prior:
+                # Never silently discard a manual edit — keep it as a restorable version.
+                await TimelineVersionRepository(session).create(
+                    pid, label="Before AI edit (auto-saved)", snapshot=repo.snapshot(prior))
+            await repo.replace_all(pid, rows)
+        return len(rows)
+
+    async def _default_story_rows(self, pid) -> List[dict]:
         provider = ai.get_story_provider()
         # pick top segments by real quality/engagement signal
         async with AsyncSessionLocal() as session:
@@ -396,19 +467,14 @@ class LocalPipeline:
                 i, seg.quality_score or 0.5, seg.engagement_score or 0.5, seg.has_face
             )
             rows.append({
-                "project_id": pid,
                 "segment_id": seg.id,
-                "position_order": i + 1,
-                "narrative_role": roles[i % len(roles)],
-                "transition_in": TransitionType.CUT if i == 0 else TransitionType(beat.transition_in),
+                "narrative_role": roles[i % len(roles)].value,
+                "transition_in": "cut" if i == 0 else beat.transition_in,
                 "trim_start_ms": seg.start_ms,
                 "trim_end_ms": seg.end_ms,
                 "edit_reasoning": beat.edit_reasoning,
             })
-        if rows:
-            async with _db_lock, AsyncSessionLocal() as session:
-                await StoryTimelineRepository(session).bulk_create(rows)
-        return len(rows)
+        return rows
 
     async def _decide_editing(self, pid, beat_count: int):
         provider = ai.get_edit_decision_provider()
@@ -435,6 +501,16 @@ class LocalPipeline:
         """Build+save the SRT from the current timeline. Shared by the full
         pipeline run and by rerender(), so subtitles never go stale after a
         manual edit or chat command changes the timeline."""
+        from backend.editing import captions as cap
+        from backend.editing import service as editing
+
+        real_cues = await editing.caption_cues(pid)
+        if real_cues:
+            srt = cap.to_srt(real_cues)
+            key = local_storage.make_subtitle_key(self.project_id, "main", "srt")
+            await local_storage.save_bytes(key, srt.encode("utf-8"))
+            return len(real_cues)
+
         async with AsyncSessionLocal() as session:
             timeline = await StoryTimelineRepository(session).get_ordered(pid)
 
@@ -465,8 +541,9 @@ class LocalPipeline:
         await self._emit({"event": "agent.completed", "agent": "subtitle",
                           "summary": f"{cue_count} cues generated (SRT)"})
 
-    async def _create_outputs(self, pid, formats):
-        # Build the real edit segment list from the story timeline.
+    async def _edit_plan(self, pid):
+        """Timeline → renderable segments + music beds + text overlays."""
+        from backend.core.render_graph import MusicTrack
         async with AsyncSessionLocal() as session:
             timeline = await StoryTimelineRepository(session).get_ordered(pid)
             clip_repo = ClipRepository(session)
@@ -480,10 +557,31 @@ class LocalPipeline:
                 src = local_storage._full(clip.s3_key)
                 start = entry.trim_start_ms if entry.trim_start_ms is not None else entry.segment.start_ms
                 end = entry.trim_end_ms if entry.trim_end_ms is not None else entry.segment.end_ms
-                edit_segments.append({"src": str(src), "start_ms": int(start), "end_ms": int(end)})
+                edit_segments.append({
+                    "src": str(src), "start_ms": int(start), "end_ms": int(end),
+                    "effects": entry.effects, "transition_in": entry.transition_in.value,
+                    "clip_id": str(clip.id), "src_w": clip.width, "src_h": clip.height,
+                    "reframe_params": entry.reframe_params,
+                })
+            music = [MusicTrack(
+                path=local_storage._full(t.s3_key), start_ms=t.start_ms, source_offset_ms=t.source_offset_ms,
+                length_ms=t.length_ms, volume=t.volume, fade_in_ms=t.fade_in_ms, fade_out_ms=t.fade_out_ms,
+                loop=t.loop, duck_original=t.duck_original,
+            ) for t in await AudioTrackRepository(session).list_for_project(pid)]
+            overlays = [{
+                "text": o.text, "start_ms": o.start_ms, "end_ms": o.end_ms, "position": o.position,
+                "font_size": o.font_size, "color": o.color, "box": o.box,
+            } for o in await TextOverlayRepository(session).list_for_project(pid)]
+        return edit_segments, music, overlays
 
-        total_dur = sum(s["end_ms"] - s["start_ms"] for s in edit_segments)
+    async def _create_outputs(self, pid, formats):
+        from backend.core.render_graph import part_output_duration
+        edit_segments, music, overlays = await self._edit_plan(pid)
+
+        total_dur = int(sum(
+            part_output_duration(s["start_ms"], s["end_ms"], s.get("effects")) * 1000 for s in edit_segments))
         any_failed = False
+        self.render_warnings: List[str] = []
 
         async with _db_lock, AsyncSessionLocal() as session:
             out_repo = OutputRepository(session)
@@ -499,18 +597,30 @@ class LocalPipeline:
                     "message": f"ffmpeg encoding {fmt} ({w}×{h}) — {len(edit_segments)} cuts",
                 })
 
-                # REAL ffmpeg render: trim + scale/pad + concat + loudnorm.
+                # REAL ffmpeg render: smart reframe + trim/speed/color + transitions + music
+                # + text + burned-in captions + loudnorm.
                 rendered = False
+                warnings: List[str] = []
                 if edit_segments:
                     try:
-                        rendered = await asyncio.to_thread(
-                            real_ops.render_edit, edit_segments, out_path, w, h
+                        from backend.editing import service as editing
+                        segs = await editing.crops_for_format(pid, edit_segments, w, h)
+                        ass = await editing.write_caption_ass(
+                            pid, w, h, local_storage._full(local_storage.make_subtitle_key(self.project_id, fmt, "ass")))
+                        res = await asyncio.to_thread(
+                            real_ops.render_edit_ex, segs, out_path, w, h,
+                            ass, True, music, overlays,
                         )
+                        rendered, warnings = res["ok"], res["warnings"]
                     except Exception as e:  # noqa: BLE001
                         logger.warning("real render failed for %s: %s", fmt, e)
+                for wmsg in warnings:
+                    if wmsg not in self.render_warnings:
+                        self.render_warnings.append(wmsg)
 
                 if rendered and out_path.exists():
-                    s3_key, size, meta = out_key, local_storage.file_size(out_key), {"real_render": True}
+                    s3_key, size = out_key, local_storage.file_size(out_key)
+                    meta = {"real_render": True, "warnings": warnings}
                     probe = await asyncio.to_thread(real_ops.probe_metadata, out_path)
                     if probe.get("duration_ms"):
                         total_dur = probe["duration_ms"]
@@ -579,4 +689,54 @@ async def rerender(project_id: str, formats: List[str] | None = None) -> Dict:
     total_dur, any_failed = await pipeline._create_outputs(pid, fmts)
     all_passed = await pipeline._qa_outputs(pid)
     await pipeline.bus.close()
-    return {"total_duration_ms": total_dur, "any_failed": any_failed, "qa_passed": all_passed}
+    return {"total_duration_ms": total_dur, "any_failed": any_failed, "qa_passed": all_passed,
+            "warnings": pipeline.render_warnings}
+
+
+async def ingest_clip_for_editing(project_id: str, clip_id: uuid.UUID) -> int:
+    """
+    Fast path for the manual editor: probe + thumbnail + real scene detection
+    for ONE clip so it can be edited immediately, without running the 11-agent
+    pipeline. Idempotent — a clip that already has segments is left alone.
+    Returns the number of segments available for the clip.
+    """
+    async with AsyncSessionLocal() as session:
+        clip = await ClipRepository(session).get(clip_id)
+        existing = await SegmentRepository(session).list_for_clip(clip_id)
+    if not clip:
+        return 0
+    if existing:
+        return len(existing)
+
+    local_path = local_storage._full(clip.s3_key)
+    meta = await asyncio.to_thread(real_ops.probe_metadata, local_path) if local_path.exists() else {}
+    dur = meta.get("duration_ms") or clip.duration_ms or 0
+    thumb_key = local_storage.make_thumbnail_key(project_id, str(clip.id))
+    await asyncio.to_thread(real_ops.extract_thumbnail, local_path, local_storage._full(thumb_key),
+                            min(1.0, dur / 2000.0) if dur else 0.0)
+    boundaries = await asyncio.to_thread(real_ops.detect_scenes, local_path, dur) if local_path.exists() else []
+    segs = []
+    for (start_ms, end_ms) in boundaries or [(0, dur)]:
+        if end_ms - start_ms < settings.MIN_SEGMENT_DURATION_MS:
+            continue
+        seg_id = uuid.uuid4()
+        kf_key = local_storage.make_keyframe_key(project_id, str(clip.id), str(seg_id))
+        q = await asyncio.to_thread(real_ops.keyframe_and_quality, local_path, (start_ms + end_ms) // 2,
+                                    local_storage._full(kf_key))
+        segs.append({
+            "id": seg_id, "clip_id": clip.id, "start_ms": start_ms, "end_ms": end_ms,
+            "segment_type": SegmentType.HIGHLIGHT if q > 0.78 else SegmentType.GOOD,
+            "quality_score": round(q, 2), "engagement_score": round(q * 0.6, 2),
+            "keyframe_s3_key": kf_key, "is_blurry": q < 0.35,
+        })
+    async with _db_lock, AsyncSessionLocal() as session:
+        await ClipRepository(session).update_video_info(
+            clip.id, duration_ms=dur or None, fps=meta.get("fps"), width=meta.get("width"),
+            height=meta.get("height"), codec_video=meta.get("codec_video"),
+            codec_audio=meta.get("codec_audio"), bitrate_kbps=meta.get("bitrate_kbps"),
+            thumbnail_s3_key=thumb_key,
+        )
+        await ClipRepository(session).mark_ingested(clip.id, {"local_mode": True, "editor_ingest": True})
+        if segs:
+            await SegmentRepository(session).bulk_create(segs)
+    return len(segs)

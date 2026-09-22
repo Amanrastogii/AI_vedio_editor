@@ -3,13 +3,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .models import (
-    AgentStatus, AgentTask, ChatMessage, ChatRole, Clip, NarrativeRole, Output, OutputFormat,
-    Project, ProjectStatus, Segment, StoryTimeline, Transcript, User,
+    AgentStatus, AgentTask, AudioTrack, ChatMessage, ChatRole, Clip, NarrativeRole, Output, OutputFormat,
+    Project, ProjectStatus, Segment, StoryTimeline, StyleAsset, StyleExample, StyleMemory, StyleProfile,
+    StyleStatus, TextOverlay, TimelineVersion, Transcript, TransitionType, User,
 )
 
 
@@ -256,6 +257,52 @@ class StoryTimelineRepository:
             )
         await self.session.commit()
 
+    async def insert_after(self, project_id: uuid.UUID, after_entry_id: Optional[uuid.UUID],
+                           segment_id: uuid.UUID, **kwargs) -> StoryTimeline:
+        """Append a new entry, then move it right after `after_entry_id` (or to the end)."""
+        entry = await self.add_entry(project_id, segment_id, **kwargs)
+        ids = [e.id for e in await self.get_ordered(project_id)]
+        if after_entry_id and after_entry_id in ids:
+            ids.remove(entry.id)
+            ids.insert(ids.index(after_entry_id) + 1, entry.id)
+            await self.reorder(project_id, ids)
+        return entry
+
+    async def replace_all(self, project_id: uuid.UUID, rows: List[dict]) -> None:
+        """Atomically replace the whole timeline (undo/redo, version restore, style apply)."""
+        await self.session.execute(delete(StoryTimeline).where(StoryTimeline.project_id == project_id))
+        await self.session.flush()
+        rows = [r for r in rows if r.get("segment_id")]
+        for i, r in enumerate(rows):
+            self.session.add(StoryTimeline(
+                project_id=project_id,
+                segment_id=uuid.UUID(str(r["segment_id"])),
+                position_order=i + 1,
+                narrative_role=NarrativeRole(r.get("narrative_role") or NarrativeRole.BROLL.value),
+                transition_in=TransitionType(r.get("transition_in") or TransitionType.CUT.value),
+                trim_start_ms=r.get("trim_start_ms"),
+                trim_end_ms=r.get("trim_end_ms"),
+                effects=r.get("effects"),
+                reframe_params=r.get("reframe_params"),
+                edit_reasoning=r.get("edit_reasoning"),
+                llm_confidence=r.get("llm_confidence"),
+            ))
+        await self.session.commit()
+
+    @staticmethod
+    def snapshot(entries: List[StoryTimeline]) -> List[dict]:
+        """Serializable copy of a timeline — the format replace_all() accepts."""
+        return [{
+            "segment_id": str(e.segment_id) if e.segment_id else None,
+            "narrative_role": e.narrative_role.value,
+            "transition_in": e.transition_in.value,
+            "trim_start_ms": e.trim_start_ms,
+            "trim_end_ms": e.trim_end_ms,
+            "effects": e.effects,
+            "reframe_params": e.reframe_params,
+            "edit_reasoning": e.edit_reasoning,
+        } for e in entries if e.segment_id]
+
 
 # ── Chat ───────────────────────────────────────────────────────────────────────
 
@@ -277,6 +324,149 @@ class ChatRepository:
             .where(ChatMessage.project_id == project_id)
             .order_by(ChatMessage.created_at)
         )
+        return list(result.scalars().all())
+
+
+# ── Manual editor tracks & versions ────────────────────────────────────────────
+
+class ProjectChildRepository:
+    """Generic CRUD for simple project-scoped tables (audio / text / versions)."""
+    model = None
+    # Column NAME, not the column itself: mapped attributes are descriptors and
+    # would be invoked against the repository instance.
+    order_by: Optional[str] = None
+    order_desc = False
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def create(self, project_id: uuid.UUID, **kwargs):
+        obj = self.model(project_id=project_id, **kwargs)
+        self.session.add(obj)
+        await self.session.commit()
+        await self.session.refresh(obj)
+        return obj
+
+    async def get(self, obj_id: uuid.UUID):
+        return await self.session.get(self.model, obj_id)
+
+    async def list_for_project(self, project_id: uuid.UUID):
+        q = select(self.model).where(self.model.project_id == project_id)
+        if self.order_by:
+            col = getattr(self.model, self.order_by)
+            q = q.order_by(col.desc() if self.order_desc else col)
+        result = await self.session.execute(q)
+        return list(result.scalars().all())
+
+    async def update(self, obj_id: uuid.UUID, **kwargs) -> None:
+        if kwargs:
+            await self.session.execute(update(self.model).where(self.model.id == obj_id).values(**kwargs))
+            await self.session.commit()
+
+    async def delete(self, obj_id: uuid.UUID) -> None:
+        obj = await self.get(obj_id)
+        if obj:
+            await self.session.delete(obj)
+            await self.session.commit()
+
+
+class AudioTrackRepository(ProjectChildRepository):
+    model = AudioTrack
+    order_by = "start_ms"
+
+
+class TextOverlayRepository(ProjectChildRepository):
+    model = TextOverlay
+    order_by = "start_ms"
+
+
+class TimelineVersionRepository(ProjectChildRepository):
+    model = TimelineVersion
+    order_by = "created_at"
+    order_desc = True
+
+
+# ── Style learning ─────────────────────────────────────────────────────────────
+
+class StyleRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    # profiles
+    async def create_profile(self, user_id: uuid.UUID, name: str, description: Optional[str]) -> StyleProfile:
+        p = StyleProfile(user_id=user_id, name=name, description=description)
+        self.session.add(p)
+        await self.session.commit()
+        await self.session.refresh(p)
+        return p
+
+    async def get_profile(self, profile_id: uuid.UUID) -> Optional[StyleProfile]:
+        result = await self.session.execute(
+            select(StyleProfile).where(StyleProfile.id == profile_id)
+            .options(selectinload(StyleProfile.examples).selectinload(StyleExample.assets))
+        )
+        return result.scalar_one_or_none()
+
+    async def list_profiles(self, user_id: uuid.UUID) -> List[StyleProfile]:
+        result = await self.session.execute(
+            select(StyleProfile).where(StyleProfile.user_id == user_id)
+            .options(selectinload(StyleProfile.examples))
+            .order_by(StyleProfile.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def update_profile(self, profile_id: uuid.UUID, **kwargs) -> None:
+        await self.session.execute(update(StyleProfile).where(StyleProfile.id == profile_id).values(**kwargs))
+        await self.session.commit()
+
+    async def delete_profile(self, profile_id: uuid.UUID) -> None:
+        p = await self.session.get(StyleProfile, profile_id)
+        if p:
+            await self.session.delete(p)
+            await self.session.commit()
+
+    # examples
+    async def create_example(self, profile_id: uuid.UUID, title: str) -> StyleExample:
+        e = StyleExample(profile_id=profile_id, title=title)
+        self.session.add(e)
+        await self.session.commit()
+        await self.session.refresh(e)
+        return e
+
+    async def get_example(self, example_id: uuid.UUID) -> Optional[StyleExample]:
+        result = await self.session.execute(
+            select(StyleExample).where(StyleExample.id == example_id)
+            .options(selectinload(StyleExample.assets))
+        )
+        return result.scalar_one_or_none()
+
+    async def update_example(self, example_id: uuid.UUID, **kwargs) -> None:
+        await self.session.execute(update(StyleExample).where(StyleExample.id == example_id).values(**kwargs))
+        await self.session.commit()
+
+    async def delete_example(self, example_id: uuid.UUID) -> None:
+        e = await self.session.get(StyleExample, example_id)
+        if e:
+            await self.session.delete(e)
+            await self.session.commit()
+
+    async def add_asset(self, example_id: uuid.UUID, kind: str, original_filename: str,
+                        s3_key: str, **kwargs) -> StyleAsset:
+        a = StyleAsset(example_id=example_id, kind=kind, original_filename=original_filename,
+                       s3_key=s3_key, **kwargs)
+        self.session.add(a)
+        await self.session.commit()
+        await self.session.refresh(a)
+        return a
+
+    # memories (retrieval store)
+    async def replace_memories(self, profile_id: uuid.UUID, rows: List[dict]) -> None:
+        await self.session.execute(delete(StyleMemory).where(StyleMemory.profile_id == profile_id))
+        self.session.add_all([StyleMemory(profile_id=profile_id, **r) for r in rows])
+        await self.session.commit()
+
+    async def list_memories(self, profile_id: uuid.UUID) -> List[StyleMemory]:
+        result = await self.session.execute(select(StyleMemory).where(StyleMemory.profile_id == profile_id))
         return list(result.scalars().all())
 
 
