@@ -6,7 +6,7 @@ import Link from "next/link";
 import AnimatedBackground from "@/components/ui/AnimatedBackground";
 import AppHeader from "@/components/ui/AppHeader";
 import SpinningDisc from "@/components/ui/SpinningDisc";
-import { Project, createProject, deleteProject, getToken, listProjects } from "@/lib/api";
+import { Project, StyleProfile, createProject, deleteProject, getToken, listProjects, listStyles } from "@/lib/api";
 import { FORMAT_META } from "@/lib/agents";
 
 const ALL_FORMATS = ["youtube", "shorts", "reels", "tiktok", "linkedin"];
@@ -37,10 +37,10 @@ const STATUS_STYLE: Record<string, { pill: string; dot: string; grad: string }> 
 };
 
 const STEPS = [
+  { icon: "🎓", title: "Teach your style", desc: "Show it past edits + raw clips" },
   { icon: "⬆️", title: "Upload clips", desc: "Drop in your raw footage" },
-  { icon: "🤖", title: "AI edits", desc: "11 agents analyze and cut" },
-  { icon: "🎛", title: "Fine-tune", desc: "Drag, trim or just chat" },
-  { icon: "🚀", title: "Export", desc: "Every format, ready to post" },
+  { icon: "🤖", title: "AI edits", desc: "Cuts it the way you would" },
+  { icon: "🎛", title: "Fine-tune & export", desc: "Split, trim, music, text — every format" },
 ];
 
 export default function Home() {
@@ -52,6 +52,8 @@ export default function Home() {
   const [formats, setFormats] = useState<string[]>(["youtube", "shorts"]);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
+  const [styles, setStyles] = useState<StyleProfile[]>([]);
+  const [styleId, setStyleId] = useState("");
 
   async function refresh() {
     try {
@@ -69,6 +71,7 @@ export default function Home() {
       return;
     }
     refresh();
+    listStyles().then((all) => setStyles(all.filter((s) => s.status === "ready"))).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -77,7 +80,7 @@ export default function Home() {
     setError("");
     setCreating(true);
     try {
-      const p = await createProject(title, formats);
+      const p = await createProject(title, formats, styleId || undefined);
       router.push(`/projects/${p.id}`);
     } catch (e: any) {
       if (/401|token/i.test(String(e.message))) router.push("/login");
@@ -185,6 +188,19 @@ export default function Home() {
                     );
                   })}
                 </div>
+                {styles.length > 0 && (
+                  <>
+                    <label className="mb-1.5 mt-5 block text-xs font-medium text-slate-400">
+                      Edit in the style of (optional)
+                    </label>
+                    <select value={styleId} onChange={(e) => setStyleId(e.target.value)} className="input-field !w-auto">
+                      <option value="">Default AI style</option>
+                      {styles.map((s) => (
+                        <option key={s.id} value={s.id}>🎓 {s.name}</option>
+                      ))}
+                    </select>
+                  </>
+                )}
               </div>
               <div className="flex items-end">
                 <button

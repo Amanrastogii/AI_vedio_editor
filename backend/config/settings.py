@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     AI_MODE: Literal["placeholder", "local", "cloud"] = "placeholder"
     AI_DEVICE: str = "cuda"  # used only once a "local" provider is implemented
 
+    # ── Speech-to-text (captions, filler-word removal) ───────────────────────
+    # "auto" uses local faster-whisper when it's installed, else no transcription.
+    # "none" disables it. Runs on CPU (int8) — no GPU or API key needed.
+    TRANSCRIPTION_PROVIDER: Literal["auto", "faster_whisper", "none"] = "auto"
+    WHISPER_MODEL: str = "base"            # tiny / base / small / medium / large-v3 (bigger = slower, better)
+    WHISPER_DEVICE: str = "cpu"            # cpu / cuda
+    WHISPER_COMPUTE_TYPE: str = "int8"     # int8 on CPU, float16 on GPU
+    WHISPER_LANGUAGE: Optional[str] = None  # None = auto-detect
+
     # ── FFmpeg ────────────────────────────────────────────────────────────────
     FFMPEG_PATH: str = "ffmpeg"
     FFPROBE_PATH: str = "ffprobe"

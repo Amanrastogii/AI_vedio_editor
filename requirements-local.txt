@@ -33,6 +33,8 @@ docstring_parser==0.18.0
 ecdsa==0.19.2
 email-validator==2.3.0
 fastapi==0.137.2
+# local speech-to-text for captions + filler-word removal (CPU; pulls ctranslate2, onnxruntime, av, tokenizers)
+faster-whisper==1.2.1
 flower==2.0.1
 frozenlist==1.8.0
 greenlet==3.5.2

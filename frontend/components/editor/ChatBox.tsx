@@ -9,10 +9,14 @@ interface Props {
 }
 
 const EXAMPLES = [
-  "remove clip 2",
-  "move clip 3 to position 1",
-  "trim clip 2 start to 5s",
-  "change transition of clip 2 to fade",
+  "remove silences and filler words",
+  "add karaoke captions",
+  "sync the cuts to the beat",
+  "make clip 2 black and white",
+  "speed up clip 1 to 2x",
+  "add text \"Day 1\" at 0s for 3s",
+  "make it 30 seconds",
+  "use dissolve transitions everywhere",
 ];
 
 export default function ChatBox({ projectId, onApplied }: Props) {
@@ -91,7 +95,7 @@ export default function ChatBox({ projectId, onApplied }: Props) {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && send()}
-          placeholder="e.g. remove clip 2"
+          placeholder="e.g. remove the ums, then sync to the beat"
           className="flex-1 rounded-lg border border-border bg-surface2 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-accent"
         />
         <button

@@ -28,6 +28,10 @@ _EDIT_DECISION = {
 
 
 def get_transcription_provider() -> TranscriptionProvider:
+    # Local faster-whisper is real, free and CPU-friendly — use it whenever it's installed.
+    from backend.audio import transcribe
+    if transcribe.available():
+        return transcribe.WhisperTranscriptionProvider()
     return _TRANSCRIPTION[settings.AI_MODE]()
 
 
@@ -44,6 +48,7 @@ def get_edit_decision_provider() -> EditDecisionProvider:
 
 
 def get_interpreter_provider() -> CommandInterpreterProvider:
-    # The rule-based interpreter needs no model, so it stays the default
-    # even outside placeholder mode until a real NLU provider is implemented.
-    return p.RuleBasedInterpreter()
+    # Rule grammar always works offline; with ANTHROPIC_API_KEY set, Claude tool-use
+    # understands free-form requests and maps them onto the same validated actions.
+    from backend.editing.commands import EditingInterpreter
+    return EditingInterpreter()

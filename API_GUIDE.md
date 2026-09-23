@@ -153,6 +153,85 @@ The `download_url` streams directly (supports seeking) and works in an HTML
 
 ---
 
+## 7. Manual editor (Premiere-style)
+
+Everything the Edit tab does is plain REST — no AI stage re-runs until you call `/render`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/projects/{id}/media/import` | Import a video mid-edit (probed + scene-detected instantly) |
+| POST | `/api/v1/projects/{id}/media/ingest` | Prepare already-uploaded clips for manual editing (skip AI) |
+| POST | `/api/v1/projects/{id}/story/clip-range` | Put any range of a raw clip on the timeline (`{clip_id, start_ms?, end_ms?}`) |
+| PATCH | `/api/v1/projects/{id}/story/{entry}` | Trim / transition / role / `effects` (`speed`, `volume`, `muted`, `brightness`, `contrast`, `saturation`, `filter`) |
+| POST | `/api/v1/projects/{id}/story/{entry}/split` | Razor cut at `{at_ms}` (source-clip time) |
+| POST | `/api/v1/projects/{id}/story/{entry}/duplicate` | Duplicate a clip |
+| POST | `/api/v1/projects/{id}/story/{entry}/join-next` | Stitch with the next clip (same source, contiguous) |
+| PUT | `/api/v1/projects/{id}/story` | Replace the whole timeline atomically (undo/redo) |
+| GET/POST | `/api/v1/projects/{id}/versions` | List / save named timeline versions |
+| POST | `/api/v1/projects/{id}/versions/{v}/restore` | Restore a version (current cut auto-saved first) |
+| GET/POST/PATCH/DELETE | `/api/v1/projects/{id}/audio[/{track}]` | Music / voice-over beds: start, offset, length, loop, volume, fades, ducking |
+| GET/POST/PATCH/DELETE | `/api/v1/projects/{id}/text[/{overlay}]` | Text overlays burned into the render |
+| POST | `/api/v1/projects/{id}/render` | Re-render: honors effects, xfade transitions, music mix, text; returns `warnings` |
+
+Transitions map to real ffmpeg `xfade` (dissolve, cross_fade, fade_to_black, wipe,
+zoom_in, zoom_out) with matching `acrossfade`; if a transition graph fails the render
+falls back to hard cuts and says so in `warnings`.
+
+## 8. Editor style learning ("teach the AI how you edit")
+
+Upload finished edits **with the raw clips they were cut from**; the AI aligns every
+frame of the edit back onto the raw footage (perceptual hashes) to recover what was
+kept, trims, speed, transitions, color grade and audio treatment, trains a keep/cut
+model plus a retrieval memory of past decisions, then cuts new footage the same way.
+Runs fully on CPU. With `ANTHROPIC_API_KEY` set, Claude also writes a plain-English
+description of the style from the measured data.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST / GET | `/api/v1/styles` | Create / list style profiles |
+| GET / PATCH / DELETE | `/api/v1/styles/{id}` | Profile with learned style, metrics, examples |
+| POST | `/api/v1/styles/{id}/examples` | multipart: `edited` (1 file) + `raw` (many) + `title` |
+| DELETE | `/api/v1/styles/{id}/examples/{ex}` | Remove an example |
+| POST | `/api/v1/styles/{id}/train?reanalyze=false` | Background analyze + train; poll `GET /styles/{id}` |
+| POST | `/api/v1/projects/{id}/apply-style` | Re-cut a project's timeline in a style (`{profile_id}`) |
+
+To make the **AI pipeline** use a style, set `target_style.style_profile_id` on the
+project (`POST /projects` or `PATCH /projects/{id}`) before `/process`.
+
+## 9. Auto-edit assists: captions, silence removal, beat sync, reframing, chat
+
+All local (CPU). Speech-to-text needs `pip install faster-whisper` (the `base`
+model, ~145 MB, downloads on first use — see `WHISPER_*` in `.env.example`).
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET / PATCH | `/api/v1/projects/{id}/editor-settings` | `captions` (enabled, preset bold/karaoke/classic/minimal, position, font_size, uppercase, highlight_color, hide_fillers) and `reframe.mode` (smart/center/fit) |
+| POST | `/api/v1/projects/{id}/transcribe?force=false` | Background transcription (word timestamps, cached per clip) → job |
+| GET | `/api/v1/projects/{id}/jobs/{job_id}` | Job progress (`running` / `done` / `failed`) |
+| GET | `/api/v1/projects/{id}/captions` | Caption cues in sequence time — re-derived from the timeline, so they follow every edit |
+| PUT | `/api/v1/projects/{id}/captions/words` | Fix caption text (`{word_ids, text}`) |
+| GET | `/api/v1/projects/{id}/captions.srt` · `.vtt` | Export |
+| POST | `/api/v1/projects/{id}/cleanup` | Remove silences (only in clips with speech) + filler words; `dry_run: true` previews |
+| POST | `/api/v1/projects/{id}/audio/{track}/beats` | Tempo + beat grid (numpy beat tracker) |
+| GET | `/api/v1/projects/{id}/audio/{track}/beat-grid?every=1` | Beat times in sequence ms |
+| POST | `/api/v1/projects/{id}/beat-sync` | Snap cut points to the beat (`{track_id, every?, dry_run}`) |
+| GET | `/api/v1/projects/{id}/reframe/tracks` | Per-clip subject path used for smart vertical crops |
+| PATCH | `/api/v1/projects/{id}/story/{entry}` | `reframe_params: {"mode": "smart"|"center"|"fit"|"manual", "x": 0..1}` per clip |
+
+Renders apply all of it: captions are burned in as styled ASS subtitles, and when
+a clip's shape differs from the output (16:9 → 9:16) it is cropped to follow the
+subject instead of letterboxed (falls back to letterboxing if the crop fails).
+Cleanup, beat sync, style apply and "make it Ns" auto-save the previous cut as a version.
+
+**Chat** (`POST /projects/{id}/chat`) understands e.g. "remove silences and filler
+words", "add karaoke captions", "sync the cuts to the beat every bar", "split clip 2
+at 3s", "speed up clip 1 to 2x", "make clips 1-3 black and white", "use dissolve
+transitions everywhere", "add text 'Day 1' at 2s for 3s", "make it 30 seconds",
+"smart crop", "apply style Travel", "render" — chain with `;` or "then". With
+`ANTHROPIC_API_KEY` set, Claude interprets free-form requests into the same actions.
+
+---
+
 ## External API keys — what you actually need
 
 | Capability | Needed? | Key / Setup |

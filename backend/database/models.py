@@ -112,6 +112,8 @@ class Project(TimestampMixin, Base):
     output_formats: Mapped[Optional[List]] = mapped_column(JSON)      # list of OutputFormat values
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+    # Manual-editor settings: {"captions": {...}, "reframe": {"mode": "smart"}} — see backend/editing/settings.py
+    editor_settings: Mapped[Optional[Dict]] = mapped_column(JSON)
 
     user: Mapped["User"] = relationship(back_populates="projects")
     clips: Mapped[List["Clip"]] = relationship(back_populates="project", cascade="all, delete-orphan")
@@ -214,6 +216,9 @@ class StoryTimeline(TimestampMixin, Base):
     reframe_params: Mapped[Optional[Dict]] = mapped_column(JSON)        # {"x": 0.1, "y": 0.0}
     edit_reasoning: Mapped[Optional[str]] = mapped_column(Text)          # LLM's explanation
     llm_confidence: Mapped[Optional[float]] = mapped_column(Float)
+    # Per-clip manual effects: {"speed": 1.0, "volume": 1.0, "muted": false,
+    # "brightness": 0.0, "contrast": 1.0, "saturation": 1.0, "filter": "none"}
+    effects: Mapped[Optional[Dict]] = mapped_column(JSON)
 
     __table_args__ = (UniqueConstraint("project_id", "position_order"),)
 
@@ -281,3 +286,129 @@ class ChatMessage(Base):
     )
 
     project: Mapped["Project"] = relationship(back_populates="chat_messages")
+
+
+# ── Manual editor: audio / text tracks + timeline versions ───────────────────
+
+class AudioTrack(TimestampMixin, Base):
+    """A song / voice-over laid under the video track (mixed at render time)."""
+    __tablename__ = "audio_tracks"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    original_filename: Mapped[str] = mapped_column(Text, nullable=False)
+    s3_key: Mapped[str] = mapped_column(Text, nullable=False)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    start_ms: Mapped[int] = mapped_column(Integer, default=0)          # where it starts on the timeline
+    source_offset_ms: Mapped[int] = mapped_column(Integer, default=0)  # skip into the song
+    length_ms: Mapped[Optional[int]] = mapped_column(Integer)          # None = until video ends
+    volume: Mapped[float] = mapped_column(Float, default=0.8)
+    fade_in_ms: Mapped[int] = mapped_column(Integer, default=500)
+    fade_out_ms: Mapped[int] = mapped_column(Integer, default=1500)
+    loop: Mapped[bool] = mapped_column(Boolean, default=False)
+    duck_original: Mapped[float] = mapped_column(Float, default=1.0)   # multiplier on clip audio while this plays
+    analysis: Mapped[Optional[Dict]] = mapped_column(JSON)              # {"bpm": 120.0, "beats_ms": [...]} (backend/audio/beats.py)
+
+
+class TextOverlay(TimestampMixin, Base):
+    """A title / caption burned into the render between start_ms and end_ms of the sequence."""
+    __tablename__ = "text_overlays"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    start_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    position: Mapped[str] = mapped_column(String(16), default="bottom")  # top / center / bottom
+    font_size: Mapped[int] = mapped_column(Integer, default=56)
+    color: Mapped[str] = mapped_column(String(16), default="white")
+    box: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class TimelineVersion(Base):
+    """A named snapshot of the whole timeline, restorable at any time."""
+    __tablename__ = "timeline_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    snapshot: Mapped[List] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ── Editor style learning (see backend/style/) ───────────────────────────────
+
+class StyleStatus(str, enum.Enum):
+    DRAFT = "draft"
+    ANALYZING = "analyzing"
+    TRAINING = "training"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class StyleProfile(TimestampMixin, Base):
+    """An editor's learned style: aggregate style stats + a trained keep/drop model."""
+    __tablename__ = "style_profiles"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[StyleStatus] = mapped_column(Enum(StyleStatus), default=StyleStatus.DRAFT, nullable=False)
+    style: Mapped[Optional[Dict]] = mapped_column(JSON)        # aggregate style (pacing, color, audio …)
+    model: Mapped[Optional[Dict]] = mapped_column(JSON)        # trained selector weights + scaler
+    metrics: Mapped[Optional[Dict]] = mapped_column(JSON)      # training diagnostics
+    summary: Mapped[Optional[str]] = mapped_column(Text)       # human-readable style description
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    trained_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    examples: Mapped[List["StyleExample"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
+
+
+class StyleExample(TimestampMixin, Base):
+    """One training pair: an editor's finished edit + the raw footage it was cut from."""
+    __tablename__ = "style_examples"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("style_profiles.id", ondelete="CASCADE"), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[StyleStatus] = mapped_column(Enum(StyleStatus), default=StyleStatus.DRAFT, nullable=False)
+    analysis: Mapped[Optional[Dict]] = mapped_column(JSON)     # per-example findings (alignment, pacing …)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+
+    profile: Mapped["StyleProfile"] = relationship(back_populates="examples")
+    assets: Mapped[List["StyleAsset"]] = relationship(back_populates="example", cascade="all, delete-orphan")
+
+
+class StyleAsset(TimestampMixin, Base):
+    __tablename__ = "style_assets"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    example_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("style_examples.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)   # "edited" | "raw"
+    original_filename: Mapped[str] = mapped_column(Text, nullable=False)
+    s3_key: Mapped[str] = mapped_column(Text, nullable=False)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    width: Mapped[Optional[int]] = mapped_column(Integer)
+    height: Mapped[Optional[int]] = mapped_column(Integer)
+
+    example: Mapped["StyleExample"] = relationship(back_populates="assets")
+
+
+class StyleMemory(Base):
+    """
+    Retrieval memory (the "R" in RAG): one row per raw shot the editor saw,
+    with its feature vector and what the editor did with it. At apply-time the
+    nearest memories vote on keep/drop + how to trim.
+    """
+    __tablename__ = "style_memories"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("style_profiles.id", ondelete="CASCADE"), nullable=False)
+    example_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("style_examples.id", ondelete="CASCADE"), nullable=False)
+    features: Mapped[List] = mapped_column(JSON, nullable=False)
+    kept: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    decision: Mapped[Optional[Dict]] = mapped_column(JSON)     # trims, speed, edit position …
+    description: Mapped[Optional[str]] = mapped_column(Text)
